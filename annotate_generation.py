@@ -44,8 +44,8 @@ def load_thermal_model(ckpt_dir: str, device: torch.device):
     # Tokenizer was saved alongside the checkpoint
     tokenizer = AutoTokenizer.from_pretrained(ckpt.as_posix())
 
-    # Build a fresh ThermalLM wrapper on the same base (distilgpt2 by default)
-    model = ThermalLMForCausalLM.from_base_pretrained("distilgpt2")
+    # Build a fresh ThermalLM wrapper on the same base (gpt2 by default)
+    model = ThermalLMForCausalLM.from_base_pretrained("gpt2")
 
     # Load weights
     state = torch.load(weights, map_location="cpu")
