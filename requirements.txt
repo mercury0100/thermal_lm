@@ -1,0 +1,8 @@
+torch>=2.0
+transformers>=4.35
+datasets>=2.15
+tokenizers>=0.14
+numpy>=1.22
+tqdm>=4.64
+accelerate>=0.24
+peft

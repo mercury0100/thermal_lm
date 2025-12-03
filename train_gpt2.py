@@ -1,31 +1,47 @@
 #!/usr/bin/env python3
 """
-Thermal LM Experiments (GPT-2) — Baseline vs Thermal (Free-Energy)
--------------------------------------------------------------------
+Thermal LM Experiments (GPT-2) — Multi-dataset / Multi-variant
+==============================================================
 
 Variants:
-    --variant baseline   → Standard GPT-2 fine-tune
-    --variant thermal    → Thermal LM with per-token learned temperature τ(x)
+    --variants baseline thermal
+
+Datasets (all treated autoregressively, LM-style):
+    - c4-small        → LM blocks from allenai/c4 (realnewslike)
+    - wikitext-103    → LM blocks from wikitext-103-raw-v1
+    - nq_open         → Natural Questions Open as "Q: ...\\nA: ..." LM text
 
 This trains and evaluates models with:
-  - Perplexity, entropy, τ statistics, and corr(entropy, τ)
-  - Calibration (ECE + reliability diagrams)
-  - Optional epistemic MI via dropout
-  - Optional OOD perplexity evaluation
+  - Perplexity (LM-style next-token prediction)
+  - Entropy, τ statistics, corr(entropy, τ) (for thermal variant)
+  - Stepwise evaluation with --eval_every (more frequent than epochs)
+  - Optional LoRA adapters with dropout (--use_lora)
+
+Example:
+
+python train_gpt2.py \
+  --datasets c4-small wikitext-103 nq_open \
+  --variants baseline \
+  --max_steps 5000
 """
 
 import os
 import math
 import json
 import csv
+import time
 import random
 import argparse
 from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import shutil  # for deleting old checkpoints
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
+
 from datasets import load_dataset, disable_progress_bar
 from transformers import (
     AutoTokenizer,
@@ -33,28 +49,138 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-# Import your Thermal LM wrapper
+# Import the Thermal LM wrapper (from thermal_lm.py)
 from thermal_lm import ThermalLMForCausalLM
 
-# Disable Hugging Face progress noise
+# Quiet datasets/tokenizers
 disable_progress_bar()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("DATASETS_DISABLE_PROGRESS_BAR", "1")
 
 
-# ---------------------------------------------------------------
-# Forward Adapter
-# ---------------------------------------------------------------
+# ===============================
+# Telemetry
+# ===============================
+class Telemetry:
+    def __init__(self, out_dir: Path, use_wandb: bool = False, project: str = "thermal-gpt2"):
+        self.out_dir = out_dir
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.out_dir / "train_log.csv"
+
+        # OPEN IN WRITE MODE: start fresh each run
+        self.csv_fp = open(self.csv_path, "w", newline="")
+        self.writer = csv.writer(self.csv_fp)
+        # Always write header
+        self.writer.writerow(["time", "step", "epoch", "split", "metric", "value"])
+
+        self.use_wandb = use_wandb
+        self.wb = None
+        if use_wandb:
+            try:
+                import wandb
+                self.wb = wandb
+                if not wandb.run:
+                    wandb.init(project=project)
+            except Exception:
+                self.use_wandb = False
+
+    def log(self, step: int, epoch: float, split: str, metrics: Dict[str, float]):
+        ts = time.time()
+        for k, v in metrics.items():
+            self.writer.writerow([ts, step, epoch, split, k, v])
+        self.csv_fp.flush()
+        if self.use_wandb and self.wb is not None:
+            self.wb.log({f"{split}/{k}": v for k, v in metrics.items()}, step=step)
+
+    def close(self):
+        try:
+            self.csv_fp.close()
+        except Exception:
+            pass
+
+
+# ===============================
+# LoRA helpers
+# ===============================
+def try_import_peft():
+    try:
+        from peft import LoraConfig, get_peft_model
+        return LoraConfig, get_peft_model
+    except Exception as e:
+        raise RuntimeError(
+            "PEFT is required when --use_lora is set. Install with `pip install peft`."
+        ) from e
+
+
+def add_lora(model, rank: int, alpha: int, dropout: float):
+    """
+    Wrap model with LoRA adapters on GPT-2-style projection modules.
+    """
+    LoraConfig, get_peft_model = try_import_peft()
+    # GPT-2 blocks use c_attn (QKV together), c_fc, c_proj
+    targets = ["c_attn", "c_fc", "c_proj"]
+    cfg = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=targets,
+    )
+    return get_peft_model(model, cfg)
+
+
+def collect_param_groups(
+    model,
+    base_lr: float,
+    wd: float,
+    variant: str,
+    lora_lr: Optional[float] = None,
+    tau_lr_mult: float = 0.5,
+):
+    """
+    Separate base / tau / LoRA params with possibly different learning rates.
+    """
+    groups = []
+    lora_params, tau_params, base_params = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "lora_" in n or "lora_A" in n or "lora_B" in n:
+            lora_params.append(p)
+        elif variant == "thermal" and n.startswith("fc_logtau"):
+            tau_params.append(p)
+        else:
+            base_params.append(p)
+
+    if base_params:
+        groups.append({"params": base_params, "lr": base_lr, "weight_decay": wd})
+    if tau_params:
+        groups.append({"params": tau_params, "lr": base_lr * tau_lr_mult, "weight_decay": wd})
+    if lora_params:
+        groups.append({"params": lora_params, "lr": lora_lr or base_lr, "weight_decay": wd})
+    return groups
+
+
+# ===============================
+# Forward adapter
+# ===============================
 def forward_three(model, tokens, attn, variant: str):
     """
     Standardize outputs across variants.
-    Returns: (logits, logits_for_loss, aux_logtau)
+    Returns: (logits_for_eval, logits_for_loss, logtau_field)
+      logits_*: (B, T, V)
+      logtau_field: (B, T)
     """
     if variant == "thermal":
         out = model(input_ids=tokens, attention_mask=attn)
         logits = out.logits
         aux = getattr(out, "aux", None)
-        logtau = aux.get("logtau") if aux and "logtau" in aux else torch.zeros_like(tokens, dtype=logits.dtype)
+        if aux is not None and "logtau" in aux:
+            logtau = aux["logtau"]
+        else:
+            B, T, _ = logits.size()
+            logtau = torch.zeros(B, T, device=logits.device, dtype=logits.dtype)
         return logits, logits, logtau
     else:
         out = model(input_ids=tokens, attention_mask=attn)
@@ -63,70 +189,70 @@ def forward_three(model, tokens, attn, variant: str):
         zeros = torch.zeros(B, T, device=logits.device, dtype=logits.dtype)
         return logits, logits, zeros
 
-# ---------------------------------------------------------------
-# Evaluation (PPL, entropy, τ correlation)
-# ---------------------------------------------------------------
-@torch.no_grad()
-def evaluate(model, dataloader, device, variant):
-    model.eval()
-    total_nll, total_tokens = 0.0, 0
-    n = 0
-    sx = sy = sx2 = sy2 = sxy = 0.0
 
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        tokens = input_ids[:, :-1].contiguous()
-        labels = input_ids[:, 1:].contiguous()
-        attn = attention_mask[:, :-1].contiguous()
+# ===============================
+# Datasets (autoregressive LM)
+# ===============================
+def lm_build_train_val(tokenizer, name: str, block_size: int, batch_size: int):
+    """C4 / C4-small (streaming) → fixed-length LM blocks without padding."""
+    from itertools import islice
+    name = name.lower()
+    assert name in ["c4", "c4-small"], f"Unsupported dataset for LM: {name}"
+    if name == "c4":
+        train_blocks, val_blocks = 50000, 2000
+    else:
+        train_blocks, val_blocks = 10000, 1000
 
-        _, logits, aux = forward_three(model, tokens, attn, variant)
-        B, T, V = logits.size()
+    ds = load_dataset("allenai/c4", "realnewslike", streaming=True)
+    eos = tokenizer.eos_token_id or 0
 
-        nll = F.cross_entropy(logits.reshape(-1, V), labels.reshape(-1), reduction="sum")
-        total_nll += nll.item()
-        total_tokens += B * T
+    def stream_blocks(example_iter, n_blocks):
+        buf = []
+        yielded = 0
+        for ex in example_iter:
+            text = ex.get("text", "")
+            if not text:
+                continue
+            ids = tokenizer.encode(text, add_special_tokens=True)
+            if eos:
+                ids.append(eos)
+            buf.extend(ids)
+            while len(buf) >= block_size and yielded < n_blocks:
+                block = buf[:block_size]
+                buf = buf[block_size:]
+                yielded += 1
+                yield torch.tensor(block, dtype=torch.long)
+                if yielded >= n_blocks:
+                    break
 
-        # Entropy from base logits (no τ)
-        if variant == "thermal":
-            if hasattr(model, "transformer"):
-                h = model.transformer(input_ids=tokens, attention_mask=attn).last_hidden_state
-                logits_base = model.lm_head(h)
-            else:
-                logits_base = model.base(tokens).logits
-            probs = torch.softmax(logits_base, dim=-1)
-            token_ent = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-            tau_field = aux.exp()
-        else:
-            probs = torch.softmax(logits, dim=-1)
-            token_ent = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-            tau_field = torch.zeros_like(token_ent)
+    tr_it = ds["train"].shuffle(seed=42)
+    va_it = ds["validation"].shuffle(seed=43)
+    train_ids = list(islice(stream_blocks(tr_it, train_blocks), train_blocks))
+    val_ids = list(islice(stream_blocks(va_it, val_blocks), val_blocks))
 
-        x = token_ent.reshape(-1).double()
-        y = tau_field.reshape(-1).double()
-        nb = x.numel()
-        n += nb
-        sx += x.sum().item()
-        sy += y.sum().item()
-        sx2 += (x * x).sum().item()
-        sy2 += (y * y).sum().item()
-        sxy += (x * y).sum().item()
+    train = TensorDataset(
+        torch.stack(train_ids),
+        torch.ones_like(train_ids[0]).repeat(len(train_ids), 1),
+    )
+    val = TensorDataset(
+        torch.stack(val_ids),
+        torch.ones_like(val_ids[0]).repeat(len(val_ids), 1),
+    )
 
-    ppl = math.exp(total_nll / max(1, total_tokens))
-    denom_x = n * sx2 - (sx ** 2)
-    denom_y = n * sy2 - (sy ** 2)
-    corr = (n * sxy - sx * sy) / math.sqrt(max(denom_x, 1e-12) * max(denom_y, 1e-12)) if (n > 1 and denom_x > 0 and denom_y > 0) else 0.0
+    def collate(b):
+        x = torch.stack([t[0] for t in b])
+        m = torch.stack([t[1] for t in b])
+        return {"input_ids": x, "attention_mask": m}
 
-    ent_mean = sx / max(1, n)
-    tau_mean = sy / max(1, n)
-    return ppl, float(ent_mean), float(tau_mean), float(corr)
+    return (
+        DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collate),
+        DataLoader(val, batch_size=batch_size, shuffle=False, collate_fn=collate),
+    )
 
 
-# ---------------------------------------------------------------
-# Data loader
-# ---------------------------------------------------------------
-def build_dataloaders(tokenizer, block_size, batch_size):
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1")
+def wikitext103_build_train_val(tokenizer, block_size: int, batch_size: int):
+    """wikitext-103-raw-v1 → fixed-length LM blocks."""
+    ds = load_dataset("wikitext", "wikitext-103-raw-v1")
 
     def tokenize_fn(examples):
         return tokenizer(examples["text"], add_special_tokens=True)
@@ -134,12 +260,18 @@ def build_dataloaders(tokenizer, block_size, batch_size):
     def group_texts(examples):
         concatenated = sum(examples["input_ids"], [])
         total_len = (len(concatenated) // block_size) * block_size
-        input_ids = [concatenated[i:i + block_size] for i in range(0, total_len, block_size)]
-        attention_mask = [[1] * block_size for _ in range(len(input_ids))]
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
+        if total_len == 0:
+            return {"input_ids": [], "attention_mask": []}
+        ids = [concatenated[i:i + block_size] for i in range(0, total_len, block_size)]
+        attn = [[1] * block_size for _ in range(len(ids))]
+        return {"input_ids": ids, "attention_mask": attn}
 
-    train_ds = ds["train"].map(tokenize_fn, batched=True, remove_columns=["text"]).map(group_texts, batched=True)
-    val_ds = ds["validation"].map(tokenize_fn, batched=True, remove_columns=["text"]).map(group_texts, batched=True)
+    train_ds = ds["train"].map(tokenize_fn, batched=True, remove_columns=["text"]).map(
+        group_texts, batched=True
+    )
+    val_ds = ds["validation"].map(tokenize_fn, batched=True, remove_columns=["text"]).map(
+        group_texts, batched=True
+    )
 
     train_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
     val_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
@@ -150,65 +282,171 @@ def build_dataloaders(tokenizer, block_size, batch_size):
     )
 
 
-# ---------------------------------------------------------------
-# Training Loop
-# ---------------------------------------------------------------
-def train_epoch(model, dataloader, optimizer, scheduler, device, variant, grad_accum_steps=1):
-    model.train()
-    total_loss = 0.0
-    steps = 0
-    optimizer.zero_grad(set_to_none=True)
+def nq_open_build_train_val(
+    tokenizer,
+    block_size: int,
+    batch_size: int,
+    max_train_examples: Optional[int] = None,
+    val_frac: float = 0.05,
+):
+    """
+    nq_open → LM over 'Q: ...\\nA: ...' strings.
+    Perplexity is plain next-token LM; no special labels.
+    """
+    ds = load_dataset("google-research-datasets/nq_open")
+    raw = ds["train"]
 
-    for i, batch in enumerate(dataloader):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+    if max_train_examples is not None and max_train_examples > 0 and len(raw) > max_train_examples:
+        raw = raw.shuffle(seed=123).select(range(max_train_examples))
 
-        tokens = input_ids[:, :-1].contiguous()
-        labels = input_ids[:, 1:].contiguous()
-        attn   = attention_mask[:, :-1].contiguous()
+    split = raw.train_test_split(test_size=val_frac, seed=321)
+    train_raw, val_raw = split["train"], split["test"]
 
-        if variant == "thermal":
-            out = model(input_ids=tokens, attention_mask=attn, labels=labels)
-            loss = out.loss / grad_accum_steps
+    def qa_to_text(ex):
+        q = ex.get("question", "")
+        ans = ex.get("answer", [])
+        if isinstance(ans, list) and len(ans) > 0:
+            a = ans[0]
         else:
-            logits = model(input_ids=tokens, attention_mask=attn).logits
-            B, T, V = logits.size()
-            loss = F.cross_entropy(
-                logits.reshape(-1, V),
-                labels.reshape(-1),
-                reduction="mean"
-            ) / grad_accum_steps
+            a = str(ans) if ans is not None else ""
+        text = f"Q: {q}\nA: {a}"
+        return {"text": text}
 
-        loss.backward()
+    train_raw = train_raw.map(qa_to_text)
+    val_raw = val_raw.map(qa_to_text)
 
-        if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(dataloader):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+    def tokenize_fn(examples):
+        return tokenizer(examples["text"], add_special_tokens=True)
 
-        total_loss += loss.item() * grad_accum_steps
-        steps += 1
+    def group_texts(examples):
+        concatenated = sum(examples["input_ids"], [])
+        total_len = (len(concatenated) // block_size) * block_size
+        if total_len == 0:
+            return {"input_ids": [], "attention_mask": []}
+        ids = [concatenated[i:i + block_size] for i in range(0, total_len, block_size)]
+        attn = [[1] * block_size for _ in range(len(ids))]
+        return {"input_ids": ids, "attention_mask": attn}
 
-    return total_loss / max(1, steps)
+    # Important: drop all original columns (question, answer, etc.) before grouping
+    train_ds = (
+        train_raw
+        .map(tokenize_fn, batched=True, remove_columns=train_raw.column_names)
+        .map(group_texts, batched=True)
+    )
+    val_ds = (
+        val_raw
+        .map(tokenize_fn, batched=True, remove_columns=val_raw.column_names)
+        .map(group_texts, batched=True)
+    )
 
-# ---------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", type=str, choices=["baseline", "thermal"], default="thermal")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--lambda_reg", type=float, default=1e-3, help="λ regularizer for logτ²")
-    parser.add_argument("--alpha_entropy", type=float, default=1e-3, help="α coefficient for entropy term")
-    parser.add_argument("--save_dir", type=str, default="checkpoints")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    val_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False),
+    )
+
+
+# ===============================
+# Evaluation (PPL, entropy, τ corr)
+# ===============================
+@torch.no_grad()
+def evaluate_autoregressive(model, loader, device, variant: str):
+    """
+    LM-style evaluation:
+      - labels are next-token targets (shifted input_ids)
+      - perplexity over all non-masked tokens
+    """
+    model.eval()
+    total_nll = 0.0
+    total_tok = 0
+
+    n = 0
+    sx = sy = sx2 = sy2 = sxy = 0.0
+
+    for batch in loader:
+        ids = batch["input_ids"].to(device)
+        attn = batch["attention_mask"].to(device)
+
+        tokens = ids[:, :-1].contiguous()
+        labels_tgt = ids[:, 1:].contiguous()
+        attn_tok = attn[:, :-1].contiguous()
+        valid = attn_tok > 0
+
+        logits_eval, logits_loss, logtau = forward_three(model, tokens, attn_tok, variant)
+        B, T, V = logits_loss.size()
+
+        labels_flat = labels_tgt.view(-1)
+        logits_flat = logits_loss.view(-1, V)
+        valid_flat = valid.view(-1)
+
+        ce_all = F.cross_entropy(
+            logits_flat,
+            labels_flat.clamp_min(0),
+            reduction="none",
+        )
+        ce_valid = ce_all[valid_flat]
+        total_nll += float(ce_valid.sum().item())
+        total_tok += int(valid_flat.sum().item())
+
+        # Entropy & τ stats on valid positions
+        if variant == "thermal":
+            probs = torch.softmax(logits_eval, dim=-1)  # uses τ-scaled logits
+            token_ent_all = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+            tau_field_all = logtau.exp()
+        else:
+            probs = torch.softmax(logits_eval, dim=-1)
+            token_ent_all = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+            tau_field_all = torch.zeros_like(token_ent_all)
+
+        x = token_ent_all[valid].reshape(-1).double()
+        y = tau_field_all[valid].reshape(-1).double()
+        nb = x.numel()
+        if nb == 0:
+            continue
+
+        n += nb
+        sx += x.sum().item()
+        sy += y.sum().item()
+        sx2 += (x * x).sum().item()
+        sy2 += (y * y).sum().item()
+        sxy += (x * y).sum().item()
+
+    if total_tok == 0:
+        ppl = float("inf")
+    else:
+        mean_nll = total_nll / total_tok
+        ppl = math.exp(mean_nll)
+
+    denom_x = n * sx2 - (sx ** 2)
+    denom_y = n * sy2 - (sy ** 2)
+    if n > 1 and denom_x > 0 and denom_y > 0:
+        corr = (n * sxy - sx * sy) / math.sqrt(denom_x * denom_y)
+    else:
+        corr = 0.0
+
+    ent_mean = sx / max(1, n)
+    tau_mean = sy / max(1, n)
+    return float(ppl), float(ent_mean), float(tau_mean), float(corr)
+
+
+# ===============================
+# Training step
+# ===============================
+def train_step(model, batch, device):
+    ids = batch["input_ids"].to(device)
+    attn = batch["attention_mask"].to(device)
+    # LM-style: labels = ids (ThermalLM/GPT2 will shift internally)
+    out = model(input_ids=ids, attention_mask=attn, labels=ids)
+    return out.loss
+
+
+# ===============================
+# One experiment (dataset, variant)
+# ===============================
+def train_one_task(args):
+    # Repro
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -216,49 +454,350 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🔥 Running {args.variant.upper()} variant on {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    train_loader, val_loader = build_dataloaders(tokenizer, args.max_length, args.batch_size)
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
+    # Data (all LM-style)
+    if args.task != "lm":
+        raise ValueError(f"Unsupported task: {args.task} (only 'lm' is used)")
+
+    ds_name = args.train_dataset.lower()
+    if ds_name in {"c4-small", "c4"}:
+        train_loader, val_loader = lm_build_train_val(
+            tokenizer,
+            "c4-small" if ds_name == "c4-small" else "c4",
+            args.max_length,
+            args.batch_size,
+        )
+    elif ds_name in {"wikitext-103", "wikitext103"}:
+        train_loader, val_loader = wikitext103_build_train_val(
+            tokenizer,
+            args.max_length,
+            args.batch_size,
+        )
+    elif ds_name in {"nq_open", "natural-questions", "naturalquestions"}:
+        train_loader, val_loader = nq_open_build_train_val(
+            tokenizer,
+            args.max_length,
+            args.batch_size,
+        )
+    else:
+        raise ValueError(f"Unknown LM dataset: {args.train_dataset}")
+
+    metric_name = "ppl"
+    higher_is_better = False
+
+    # Model
     if args.variant == "thermal":
         model = ThermalLMForCausalLM.from_base_pretrained(
-            "gpt2",
+            base_model_name_or_path=args.base_model,
+            tau_clamp_min=args.tau_clamp_min,
+            tau_clamp_max=args.tau_clamp_max,
             lambda_reg=args.lambda_reg,
-            alpha_entropy=args.alpha_entropy
+            tau_smooth=args.tau_smooth,
         ).to(device)
     else:
-        model = AutoModelForCausalLM.from_pretrained("gpt2").to(device)
+        model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
 
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if n.endswith(".bias") or "ln" in n.lower() or "norm" in n.lower():
-            no_decay.append(p)
+    # Optional LoRA
+    if args.use_lora:
+        model = add_lora(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
+
+    # optionally freeze backbone
+    if args.freeze_backbone:
+        if args.variant == "thermal":
+            # Only train the thermal head (fc_logtau*)
+            for n, p in model.named_parameters():
+                if n.startswith("fc_logtau"):
+                    p.requires_grad = True
+                else:
+                    p.requires_grad = False
         else:
-            decay.append(p)
+            # Baseline: everything frozen
+            for p in model.parameters():
+                p.requires_grad = False
 
-    optimizer = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.01, "lr": args.lr},
-         {"params": no_decay, "weight_decay": 0.0, "lr": args.lr}]
+    # Telemetry / checkpoints
+    dataset_tag = args.train_dataset
+    ckpt_tag = f"{args.variant}_{dataset_tag}_gpt2"
+    out_dir = Path(args.save_dir) / ckpt_tag
+
+    # Wipe previous runs for this (variant, dataset)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tel = Telemetry(out_dir, use_wandb=args.wandb, project="thermal-gpt2")
+
+    # Initial eval
+    model.eval()
+    ppl_init, ent_init, tau_init, corr_init = evaluate_autoregressive(
+        model, val_loader, device, args.variant
+    )
+    tel.log(0, 0.0, "val_init", {
+        "ppl": ppl_init,
+        "entropy": ent_init,
+        "tau_mean": tau_init,
+        "corr_ent_tau": corr_init,
+    })
+    print(
+        f"[Init Eval] PPL={ppl_init:.4f} | Entropy={ent_init:.4f} | "
+        f"TauMean={tau_init:.4f} | Corr(ent,τ)={corr_init:.4f}"
     )
 
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * total_steps), total_steps)
+    # if baseline + freeze_backbone, just checkpoint and exit
+    if args.freeze_backbone and args.variant == "baseline":
+        save_path = out_dir / f"frozen_init_ppl{ppl_init:.4f}"
+        save_path.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_path / "pytorch_model.bin")
+        tokenizer.save_pretrained(save_path.as_posix())
+        with open(save_path / "train_args.json", "w") as f:
+            json.dump(vars(args), f, indent=2)
+        print(f"[FreezeBackbone] Baseline frozen checkpoint saved at: {save_path}")
+        tel.close()
+        return
 
-    best_ppl = float("inf")
+    best_metric = ppl_init
+    best_path: Optional[Path] = None
+    global_step = 0
+    bad_steps = 0
+    running_loss = 0.0
+
+    # Optimizer: param groups for base / tau / LoRA (after freezing)
+    param_groups = collect_param_groups(
+        model,
+        base_lr=args.lr,
+        wd=args.weight_decay,
+        variant=args.variant,
+        lora_lr=args.lora_lr if args.use_lora else None,
+        tau_lr_mult=args.tau_lr_mult,
+    )
+    if len(param_groups) == 0:
+        print("[Warning] No trainable parameters found. Exiting.")
+        tel.close()
+        return
+
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
+
+    steps_per_epoch = len(train_loader)
+    nominal_total_steps = max(1, steps_per_epoch * args.epochs)
+    total_steps = (
+        nominal_total_steps if args.max_steps <= 0 else min(nominal_total_steps, args.max_steps)
+    )
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        max(1, int(0.1 * total_steps)),
+        total_steps,
+    )
+
     for epoch in range(1, args.epochs + 1):
-        loss = train_epoch(model, train_loader, optimizer, scheduler, device, args.variant,
-                           grad_accum_steps=args.grad_accum_steps)
-        ppl, ent, tau_mean, corr = evaluate(model, val_loader, device, args.variant)
-        if ppl < best_ppl:
-            best_ppl = ppl
-            Path(args.save_dir).mkdir(exist_ok=True)
-            torch.save(model.state_dict(), Path(args.save_dir) / f"{args.variant}_best_ep{epoch}.pt")
-            print(f"[Checkpoint] Saved best model at epoch {epoch}")
-        print(f"[Epoch {epoch}] FreeEnergy={loss:.4f} | PPL={ppl:.2f} | "
-              f"Entropy={ent:.3f} | TauMean={tau_mean:.4f} | Corr(ent,tau)={corr:.3f}")
+        model.train()
+        for i, batch in enumerate(train_loader):
+            loss = train_step(model, batch, device)
+            (loss / args.grad_accum_steps).backward()
+
+            update_now = ((i + 1) % args.grad_accum_steps == 0) or ((i + 1) == len(train_loader))
+            if update_now:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+                running_loss += float(loss.item())
+
+                # Logging
+                if global_step % args.log_every == 0:
+                    avg_loss = running_loss / max(1, args.log_every)
+                    tel.log(global_step, epoch + i / steps_per_epoch, "train", {"loss": avg_loss})
+                    running_loss = 0.0
+
+                # Eval
+                if global_step % args.eval_every == 0:
+                    model.eval()
+                    ppl, ent, tau_mean, corr = evaluate_autoregressive(
+                        model, val_loader, device, args.variant
+                    )
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Eval step {global_step:05d} | "
+                        f"epoch {epoch:.2f} | PPL={ppl:.4f} | "
+                        f"Entropy={ent:.4f} | TauMean={tau_mean:.4f} | Corr(ent,τ)={corr:.4f}"
+                    )
+                    tel.log(global_step, epoch + i / steps_per_epoch, "val", {
+                        "ppl": ppl,
+                        "entropy": ent,
+                        "tau_mean": tau_mean,
+                        "corr_ent_tau": corr,
+                    })
+
+                    improved = (ppl < best_metric) if not higher_is_better else (ppl > best_metric)
+                    if improved:
+                        best_metric = ppl
+                        bad_steps = 0
+
+                        # delete previous best checkpoint (if any)
+                        if best_path is not None and best_path.exists():
+                            shutil.rmtree(best_path)
+
+                        save_path = out_dir / f"best_step{global_step}_ppl{best_metric:.4f}"
+                        save_path.mkdir(parents=True, exist_ok=True)
+                        torch.save(model.state_dict(), save_path / "pytorch_model.bin")
+                        tokenizer.save_pretrained(save_path.as_posix())
+                        with open(save_path / "train_args.json", "w") as f:
+                            json.dump(vars(args), f, indent=2)
+                        best_path = save_path
+                        print(f"[Checkpoint] PPL improved → {best_metric:.4f} at step {global_step}")
+                    else:
+                        bad_steps += args.eval_every
+                        if args.patience_steps > 0 and bad_steps >= args.patience_steps:
+                            print(
+                                f"[EarlyStop] no improvement for {bad_steps} steps. "
+                                f"Best at: {best_path}"
+                            )
+                            tel.close()
+                            return
+                    model.train()
+
+                # Max steps override
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    print(
+                        f"[MaxSteps] Reached max_steps={args.max_steps}. "
+                        f"Stopping. Best at: {best_path}"
+                    )
+                    tel.close()
+                    return
+
+    tel.close()
+
+
+# ===============================
+# Orchestration (multi-dataset / multi-variant)
+# ===============================
+def resolve_task_and_dataset(name: str) -> Tuple[str, Optional[str]]:
+    """Maps a dataset token to (task, train_dataset_tag_for_lm)."""
+    key = name.lower()
+    if key in {"c4-small", "c4"}:
+        return "lm", ("c4-small" if key == "c4-small" else "c4")
+    if key in {"wikitext-103", "wikitext103"}:
+        return "lm", "wikitext-103"
+    if key in {"nq_open", "natural-questions", "naturalquestions"}:
+        return "lm", "nq_open"
+    raise ValueError(f"Unknown dataset token: {name}")
+
+
+def run_experiment(args, dataset: str, variant: str):
+    # Clone args to avoid mutation across runs
+    local = argparse.Namespace(**vars(args))
+    task, lm_name = resolve_task_and_dataset(dataset)
+    local.task = task
+    if task == "lm":
+        local.train_dataset = lm_name
+    local.variant = variant
+    print(
+        f"\n[RUN] variant={variant} dataset={dataset} → task={local.task} "
+        f"{'(train_dataset='+lm_name+')' if lm_name else ''}"
+    )
+    train_one_task(local)
+
+
+def main():
+    p = argparse.ArgumentParser()
+
+    # Multi-selection
+    p.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["c4-small", "wikitext-103", "nq_open"],
+        help="Datasets: c4-small, c4, wikitext-103, nq_open",
+    )
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        default=["thermal"],
+        choices=["baseline", "thermal"],
+        help="Model variants to run.",
+    )
+
+    # Core
+    p.add_argument("--variant", type=str, default="thermal", choices=["baseline", "thermal"])
+    p.add_argument("--base_model", type=str, default="gpt2")
+    p.add_argument(
+        "--task",
+        type=str,
+        default="lm",
+        choices=["lm"],
+        help="Internal use; all datasets are LM-style.",
+    )
+    p.add_argument(
+        "--train_dataset",
+        type=str,
+        default="c4-small",
+        help="For task=lm: one of c4-small, c4, wikitext-103, nq_open",
+    )
+
+    # Train hparams
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--max_length", type=int, default=512)
+    p.add_argument("--grad_accum_steps", type=int, default=16)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--max_steps",
+        type=int,
+        default=0,
+        help="If >0, stop after this many optimizer update steps (global steps).",
+    )
+
+    # Thermal knobs (λ for logτ² prior)
+    p.add_argument("--lambda_reg", type=float, default=0.0, help="λ for logτ²")
+    p.add_argument("--tau_clamp_min", type=float, default=-2.0)
+    p.add_argument("--tau_clamp_max", type=float, default=1.5)
+    p.add_argument("--tau_smooth", action="store_true")
+    p.add_argument("--tau_lr_mult", type=float, default=0.5, help="LR multiplier for τ-head")
+
+    # LoRA
+    p.add_argument("--use_lora", action="store_true")
+    p.add_argument("--lora_rank", type=int, default=8)
+    p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--lora_lr", type=float, default=1e-4)
+
+    # Freeze backbone
+    p.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="If set: baseline will only be evaluated & checkpointed; thermal will train only fc_logtau.",
+    )
+
+    # Saving / telemetry / eval cadence
+    p.add_argument("--save_dir", type=str, default="checkpoints_gpt2")
+    p.add_argument("--eval_every", type=int, default=50, help="steps between evals")
+    p.add_argument("--log_every", type=int, default=50, help="steps between telemetry logs")
+    p.add_argument(
+        "--patience_steps",
+        type=int,
+        default=200,
+        help="early stop if no improvement for this many steps (0=off)",
+    )
+    p.add_argument("--wandb", action="store_true")
+
+    args = p.parse_args()
+
+    # Single-run fallback
+    if args.datasets == [] and args.variants == []:
+        train_one_task(args)
+        return
+
+    # Loop over all combinations
+    for variant in args.variants:
+        for dataset in args.datasets:
+            run_experiment(args, dataset, variant)
 
 
 if __name__ == "__main__":

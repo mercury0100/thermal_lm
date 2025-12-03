@@ -1,0 +1,26 @@
+{
+  "c4-small": {
+    "baseline_ckpt": "checkpoints_gpt2/baseline_c4-small_gpt2/best_step1500_ppl25.4542",
+    "thermal_ckpt": "checkpoints_gpt2/thermal_c4-small_gpt2/best_step1250_ppl25.4754",
+    "ppl": {
+      "baseline": 24.084036892556647,
+      "thermal": 24.091556215472835
+    }
+  },
+  "wikitext-103": {
+    "baseline_ckpt": "checkpoints_gpt2/baseline_wikitext-103_gpt2/best_step4850_ppl22.4762",
+    "thermal_ckpt": "checkpoints_gpt2/thermal_wikitext-103_gpt2/best_step3800_ppl22.5811",
+    "ppl": {
+      "baseline": 20.611265230443546,
+      "thermal": 20.70669777296525
+    }
+  },
+  "nq_open": {
+    "baseline_ckpt": "checkpoints_gpt2/baseline_nq_open_gpt2/best_step450_ppl17.9924",
+    "thermal_ckpt": "checkpoints_gpt2/thermal_nq_open_gpt2/best_step450_ppl18.0226",
+    "ppl": {
+      "baseline": 17.992424344884917,
+      "thermal": 18.02258389764211
+    }
+  }
+}
