@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Make core evaluation plots for Thermal LMs (GPT-2, multi-dataset).
+Paper-ready diagnostics for Thermal LMs (calibrated σ² head).
 
-Outputs (into --out_dir), each as a 3-panel figure (one panel per dataset):
-  - fig_ppl_ece.png
-  - fig_reliability_baseline.png
-  - fig_reliability_thermal.png
-  - fig_tau_entropy.png
-  - fig_synth_ambiguity.png
+For each dataset, this script:
+  - loads baseline and thermal checkpoints,
+  - computes PPL (baseline vs thermal),
+  - collects token-level CE and σ² for the thermal model,
+  - plots CE–σ² alignment (binned curve + corr),
+  - plots risk–coverage curves (baseline confidence vs σ²-based abstention),
+  - runs a synthetic ambiguity probe (deterministic vs open prompts) on σ².
+
+Outputs (into --out_dir):
+  - fig_ce_sigma2.png
   - fig_risk_coverage.png
+  - fig_synth_ambiguity.png
+  - summary_multi.json
 
 Example:
 
@@ -53,7 +59,8 @@ def try_import_peft():
         return LoraConfig, get_peft_model
     except Exception as e:
         raise RuntimeError(
-            "PEFT is required when loading LoRA checkpoints. Install with `pip install peft`."
+            "PEFT is required when loading LoRA checkpoints. "
+            "Install with `pip install peft`."
         ) from e
 
 
@@ -99,7 +106,7 @@ def load_models_for_dataset(
     ckpt_root: str,
     dataset_tag: str,
     device: torch.device,
-) -> Tuple[AutoTokenizer, torch.nn.Module, torch.nn.Module, Dict[str, str]]:
+):
     """
     Load baseline + thermal models + tokenizer for a specific dataset.
 
@@ -145,14 +152,14 @@ def load_models_for_dataset(
     m_base.load_state_dict(sd_base, strict=True)
     m_base.eval()
 
-    # ----- Thermal model -----
+    # ----- Thermal model (calibrated σ² head) -----
     m_th = ThermalLMForCausalLM.from_base_pretrained(
         base_model_name_or_path=base_model_name,
-        tau_clamp_min=th_args.get("tau_clamp_min", -2.0),
-        tau_clamp_max=th_args.get("tau_clamp_max", 1.5),
+        logsigma_clamp_min=th_args.get("tau_clamp_min", -6.0),
+        logsigma_clamp_max=th_args.get("tau_clamp_max", 2.0),
         lambda_reg=th_args.get("lambda_reg", 0.0),
-        alpha_entropy=th_args.get("alpha_entropy", 0.0),
-        tau_smooth=th_args.get("tau_smooth", False),
+        sigma_smooth=th_args.get("tau_smooth", False),
+        noise_at_eval=False,
     ).to(device)
 
     if th_args.get("use_lora", False):
@@ -171,7 +178,7 @@ def load_models_for_dataset(
         "baseline": base_best.as_posix(),
         "thermal": th_best.as_posix(),
     }
-    return tokenizer, m_base, m_th, paths
+    return tokenizer, m_base, m_th, paths, base_args, th_args
 
 
 # ----------------------------
@@ -318,284 +325,149 @@ def build_val_loader_for_dataset(
 
 
 # ----------------------------
-# Metrics: PPL, ECE, Reliability
+# Core evaluation: CE, σ², PPL, etc.
 # ----------------------------
 @torch.no_grad()
-def ece_from_logits(logits, labels, n_bins=20):
-    probs = torch.softmax(logits, dim=-1)
-    conf, pred = probs.max(dim=-1)
-    correct = (pred == labels).float()
+def collect_stats(
+    model_b,
+    model_th,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: Optional[int] = None,
+):
+    """
+    Collect token-level statistics from baseline and thermal models:
 
-    conf = conf.flatten().cpu().numpy()
-    correct = correct.flatten().cpu().numpy()
+      - baseline_ppl, thermal_ppl
+      - arrays of CE_t (thermal), σ_t^2, entropy_t (thermal)
+      - baseline confidence & correctness
+      - thermal correctness (for risk–coverage)
+    """
+    model_b.eval()
+    model_th.eval()
 
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    ece = 0.0
-    diag = []
-    for i in range(n_bins):
-        lo, hi = bins[i], bins[i + 1]
-        idx = (conf > lo) & (conf <= hi)
-        if idx.sum() == 0:
-            diag.append((0.0, 0.0, 0))
-            continue
-        acc = correct[idx].mean()
-        c = conf[idx].mean()
-        w = idx.mean()
-        ece += w * abs(acc - c)
-        diag.append((c, acc, idx.sum()))
-    return float(ece), diag
+    total_nll_base = 0.0
+    total_nll_th = 0.0
+    total_tokens = 0
 
-
-# ----------------------------
-# Low-level helpers
-# ----------------------------
-@torch.no_grad()
-def untempered_logits_gpt2(model, tokens, attn):
-    """For GPT-2 Thermal wrapper: get logits without τ scaling (intrinsic branching)."""
-    if hasattr(model, "transformer"):
-        h = model.transformer(input_ids=tokens, attention_mask=attn).last_hidden_state
-        logits_base = model.lm_head(h)
-    else:
-        logits_base = model(input_ids=tokens, attention_mask=attn).logits
-    return logits_base
-
-
-@torch.no_grad()
-def eval_epoch(model, loader, device, variant="baseline", max_batches=None, for_tau_entropy=False):
-    model.eval()
-    total_nll, total_tokens = 0.0, 0
-    all_logits_for_ece = []
-    all_labels_for_ece = []
-    tau_list = []
+    ce_list = []
+    sigma2_list = []
     ent_list = []
-    acc_list = []
+
+    conf_b_list = []
+    corr_b_list = []
+    corr_th_list = []
 
     seen = 0
     for batch in loader:
-        input_ids = batch["input_ids"].to(device)
+        ids = batch["input_ids"].to(device)
         attn = batch["attention_mask"].to(device)
-        tokens = input_ids[:, :-1]
-        labels = input_ids[:, 1:]
-        attn = attn[:, :-1]
 
-        if variant == "thermal":
-            out = model(input_ids=tokens, attention_mask=attn)
-            logits_t = out.logits  # tempered logits
-            B, T, V = logits_t.size()
-            nll = F.cross_entropy(logits_t.reshape(-1, V), labels.reshape(-1), reduction="sum")
-            total_nll += nll.item()
-            total_tokens += B * T
+        tokens = ids[:, :-1]
+        labels = ids[:, 1:]
+        attn_tok = attn[:, :-1]
+        valid = attn_tok > 0  # (B,T)
 
-            all_logits_for_ece.append(logits_t.detach().cpu())
-            all_labels_for_ece.append(labels.detach().cpu())
+        # ----- Baseline -----
+        out_b = model_b(input_ids=tokens, attention_mask=attn_tok)
+        logits_b = out_b.logits                          # (B,T,V)
+        B, T, V = logits_b.size()
 
-            if for_tau_entropy:
-                tau = out.aux["tau"].detach()  # (B,T)
-                probs = torch.softmax(logits_t, dim=-1)
-                ent = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-                pred = probs.argmax(dim=-1)
-                acc = (pred == labels).float()
+        logits_b_flat = logits_b.reshape(-1, V)
+        labels_flat = labels.reshape(-1).clamp_min(0)
+        ce_b_flat = F.cross_entropy(
+            logits_b_flat, labels_flat, reduction="none"
+        ).reshape(B, T)
 
-                tau_list.append(tau.flatten().cpu().numpy())
-                ent_list.append(ent.flatten().cpu().numpy())
-                acc_list.append(acc.flatten().cpu().numpy())
 
-        else:
-            logits = model(input_ids=tokens, attention_mask=attn).logits
-            B, T, V = logits.size()
-            nll = F.cross_entropy(logits.reshape(-1, V), labels.reshape(-1), reduction="sum")
-            total_nll += nll.item()
-            total_tokens += B * T
-            all_logits_for_ece.append(logits.detach().cpu())
-            all_labels_for_ece.append(labels.detach().cpu())
+        ce_b_valid = ce_b_flat[valid]
+        total_nll_base += float(ce_b_valid.sum().item())
 
-            if for_tau_entropy:
-                probs = torch.softmax(logits, dim=-1)
-                ent = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-                pred = probs.argmax(dim=-1)
-                acc = (pred == labels).float()
-                tau = torch.zeros_like(ent)
-                tau_list.append(tau.flatten().cpu().numpy())
-                ent_list.append(ent.flatten().cpu().numpy())
-                acc_list.append(acc.flatten().cpu().numpy())
+        probs_b = torch.softmax(logits_b, dim=-1)
+        conf_b, pred_b = probs_b.max(dim=-1)
+        correct_b = (pred_b == labels).float()
+
+        conf_b_list.append(conf_b[valid].cpu().numpy())
+        corr_b_list.append(correct_b[valid].cpu().numpy())
+
+        # ----- Thermal (same logits distribution, plus σ) -----
+        out_th = model_th(input_ids=tokens, attention_mask=attn_tok)
+        logits_th = out_th.logits                        # (B,T,V)
+        sigma = out_th.aux["sigma"]              # (B,T) aligned with tokens
+        sigma2 = sigma ** 2
+
+        logits_th_flat = logits_th.reshape(-1, V)
+        ce_th_flat = F.cross_entropy(
+            logits_th_flat, labels_flat, reduction="none"
+        ).reshape(B, T)
+
+        ce_th_valid = ce_th_flat[valid]
+        total_nll_th += float(ce_th_valid.sum().item())
+
+        probs_th = torch.softmax(logits_th, dim=-1)
+        ent = -(probs_th * probs_th.clamp_min(1e-12).log()).sum(dim=-1)
+        pred_th = probs_th.argmax(dim=-1)
+        correct_th = (pred_th == labels).float()
+
+        ce_list.append(ce_th_valid.cpu().numpy())
+        sigma2_list.append(sigma2[valid].cpu().numpy())
+        ent_list.append(ent[valid].cpu().numpy())
+        corr_th_list.append(correct_th[valid].cpu().numpy())
+
+        total_tokens += int(valid.sum().item())
 
         seen += 1
-        if max_batches and seen >= max_batches:
+        if max_batches is not None and seen >= max_batches:
             break
 
-    ppl = math.exp(total_nll / max(1, total_tokens))
-    all_logits_for_ece = torch.cat(all_logits_for_ece, dim=0)
-    all_labels_for_ece = torch.cat(all_labels_for_ece, dim=0)
+    baseline_ppl = math.exp(total_nll_base / max(1, total_tokens))
+    thermal_ppl = math.exp(total_nll_th / max(1, total_tokens))
 
-    out = {
-        "ppl": ppl,
-        "logits_for_ece": all_logits_for_ece,
-        "labels_for_ece": all_labels_for_ece,
+    ce_all = np.concatenate(ce_list, axis=0)
+    sigma2_all = np.concatenate(sigma2_list, axis=0)
+    ent_all = np.concatenate(ent_list, axis=0)
+    conf_b_all = np.concatenate(conf_b_list, axis=0)
+    corr_b_all = np.concatenate(corr_b_list, axis=0)
+    corr_th_all = np.concatenate(corr_th_list, axis=0)
+
+    return {
+        "baseline_ppl": baseline_ppl,
+        "thermal_ppl": thermal_ppl,
+        "ce": ce_all,
+        "sigma2": sigma2_all,
+        "entropy": ent_all,
+        "conf_b": conf_b_all,
+        "corr_b": corr_b_all,
+        "corr_th": corr_th_all,
     }
-    if for_tau_entropy:
-        out["tau_vec"] = np.concatenate(tau_list, axis=0)
-        out["ent_vec"] = np.concatenate(ent_list, axis=0)
-        out["acc_vec"] = np.concatenate(acc_list, axis=0)
-    return out
 
 
 # ----------------------------
-# Plot helpers (multi-dataset)
-# ----------------------------
-def plot_ppl_ece_multi(results_by_ds: Dict[str, Dict], out_dir: str):
-    out_dir = Path(out_dir)
-    datasets = list(results_by_ds.keys())
-    n = len(datasets)
-
-    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 3.6), sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, datasets):
-        res = results_by_ds[ds]
-        base_eval = res["baseline_eval"]
-        therm_eval = res["thermal_eval"]
-
-        ece_b, _ = ece_from_logits(base_eval["logits_for_ece"], base_eval["labels_for_ece"])
-        ece_t, _ = ece_from_logits(therm_eval["logits_for_ece"], therm_eval["labels_for_ece"])
-
-        labels = ["Baseline", "Thermal"]
-        ppl = [base_eval["ppl"], therm_eval["ppl"]]
-        ece = [ece_b, ece_t]
-        x = np.arange(2)
-        w = 0.35
-        ax1 = ax
-        ax2 = ax1.twinx()
-        ax1.bar(x - w / 2, ppl, width=w, label="PPL")
-        ax2.bar(x + w / 2, ece, width=w, label="ECE", alpha=0.8)
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(labels, rotation=0)
-        ax1.set_title(ds)
-        if ax is axes[0]:
-            ax1.set_ylabel("Perplexity")
-        ax2.set_ylabel("ECE")
-
-    fig.suptitle("Perplexity & ECE (validation)")
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
-    fig.savefig(out_dir / "fig_ppl_ece.png", dpi=250)
-    plt.close(fig)
-
-    # Reliability diagrams: baseline & thermal separately
-    # baseline
-    fig_b, axes_b = plt.subplots(1, n, figsize=(4 * n, 4), sharex=True, sharey=True)
-    if n == 1:
-        axes_b = [axes_b]
-    for ax, ds in zip(axes_b, datasets):
-        base_eval = results_by_ds[ds]["baseline_eval"]
-        _, diag_b = ece_from_logits(base_eval["logits_for_ece"], base_eval["labels_for_ece"])
-        xs = [c for (c, a, cnt) in diag_b if cnt > 0]
-        ys = [a for (c, a, cnt) in diag_b if cnt > 0]
-        ax.plot([0, 1], [0, 1], linestyle="--")
-        ax.scatter(xs, ys, s=10)
-        ax.set_title(ds)
-        if ax is axes_b[0]:
-            ax.set_xlabel("Confidence")
-            ax.set_ylabel("Accuracy")
-        else:
-            ax.set_xlabel("Confidence")
-    fig_b.suptitle("Reliability: Baseline")
-    fig_b.tight_layout()
-    fig_b.subplots_adjust(top=0.88)
-    fig_b.savefig(out_dir / "fig_reliability_baseline.png", dpi=250)
-    plt.close(fig_b)
-
-    # thermal
-    fig_t, axes_t = plt.subplots(1, n, figsize=(4 * n, 4), sharex=True, sharey=True)
-    if n == 1:
-        axes_t = [axes_t]
-    for ax, ds in zip(axes_t, datasets):
-        therm_eval = results_by_ds[ds]["thermal_eval"]
-        _, diag_t = ece_from_logits(therm_eval["logits_for_ece"], therm_eval["labels_for_ece"])
-        xs = [c for (c, a, cnt) in diag_t if cnt > 0]
-        ys = [a for (c, a, cnt) in diag_t if cnt > 0]
-        ax.plot([0, 1], [0, 1], linestyle="--")
-        ax.scatter(xs, ys, s=10)
-        ax.set_title(ds)
-        if ax is axes_t[0]:
-            ax.set_xlabel("Confidence")
-            ax.set_ylabel("Accuracy")
-        else:
-            ax.set_xlabel("Confidence")
-    fig_t.suptitle("Reliability: Thermal")
-    fig_t.tight_layout()
-    fig_t.subplots_adjust(top=0.88)
-    fig_t.savefig(out_dir / "fig_reliability_thermal.png", dpi=250)
-    plt.close(fig_t)
-
-
-def plot_tau_entropy_multi(results_by_ds: Dict[str, Dict], out_dir: str, n_quant: int = 10):
-    out_dir = Path(out_dir)
-    datasets = list(results_by_ds.keys())
-    n = len(datasets)
-
-    fig, axes = plt.subplots(1, n, figsize=(5.5 * n, 3.6), sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, datasets):
-        therm_eval = results_by_ds[ds]["thermal_eval_tau"]
-        tau = therm_eval["tau_vec"]
-        ent = therm_eval["ent_vec"]
-        acc = therm_eval["acc_vec"]
-
-        qs = np.quantile(tau, np.linspace(0, 1, n_quant + 1))
-        xs = []
-        mean_ent = []
-        mean_acc = []
-        for i in range(n_quant):
-            lo, hi = qs[i], qs[i + 1]
-            idx = (tau >= lo) & (tau <= hi if i == n_quant - 1 else tau < hi)
-            if idx.sum() == 0:
-                xs.append((lo + hi) / 2)
-                mean_ent.append(np.nan)
-                mean_acc.append(np.nan)
-                continue
-            xs.append((lo + hi) / 2)
-            mean_ent.append(ent[idx].mean())
-            mean_acc.append(acc[idx].mean())
-
-        r = np.corrcoef(tau, ent)[0, 1] if np.isfinite(ent).all() else np.nan
-
-        ax2 = ax.twinx()
-        ax.plot(xs, mean_ent, marker="o", label="Entropy")
-        ax2.plot(xs, mean_acc, marker="s", linestyle="--", label="Accuracy", color="tab:orange")
-        
-        # Add combined legend
-        lines_ent, labels_ent = ax.get_legend_handles_labels()
-        lines_acc, labels_acc = ax2.get_legend_handles_labels()
-        ax.legend(lines_ent + lines_acc, labels_ent + labels_acc, loc="best")
-        
-        ax.set_title(f"{ds} (r={r:.2f})")
-        ax.set_xlabel("τ (quantile centers)")
-        if ax is axes[0]:
-            ax.set_ylabel("Predictive entropy")
-            ax2.set_ylabel("Top-1 accuracy")
-
-    fig.suptitle("τ–Entropy alignment")
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
-    fig.savefig(out_dir / "fig_tau_entropy.png", dpi=250)
-    plt.close(fig)
-
-
-# ----------------------------
-# Synthetic ambiguity probe (per dataset)
+# Synthetic ambiguity probe
 # ----------------------------
 @torch.no_grad()
-def tau_for_first_generated_token(model_th, tokenizer, prompt, device, top_p=0.95, temperature=1.0):
+def sigma2_for_first_generated_token(
+    model_th,
+    tokenizer,
+    prompt: str,
+    device: torch.device,
+    top_p: float = 0.95,
+    temperature: float = 1.0,
+) -> float:
+    """
+    For a given prompt, generate a single next token, then return σ^2 at that new position.
+    """
+    model_th.eval()
+
     enc = tokenizer(prompt, return_tensors="pt")
     input_ids = enc.input_ids.to(device)
     attn = enc.attention_mask.to(device)
 
+    # logits at last position of prompt
     out0 = model_th(input_ids=input_ids, attention_mask=attn)
     logits = out0.logits[:, -1, :] / max(1e-8, temperature)
     probs = torch.softmax(logits, dim=-1)
+
     if top_p < 1.0:
         sorted_probs, sorted_idx = torch.sort(probs, descending=True)
         cum = torch.cumsum(sorted_probs, dim=-1)
@@ -607,121 +479,135 @@ def tau_for_first_generated_token(model_th, tokenizer, prompt, device, top_p=0.9
     else:
         next_id = torch.argmax(probs[0], dim=-1)
 
+    # Append sampled token and recompute σ^2 at that position
     input_ids = torch.cat([input_ids, next_id.view(1, 1)], dim=1)
     attn = torch.ones_like(input_ids, device=device)
     out1 = model_th(input_ids=input_ids, attention_mask=attn)
-    tau_slot_after = float(out1.aux["tau"][0, -1].item())
-    return tau_slot_after
+    sigma = out1.aux["sigma"][0, -1].item()
+    return float(sigma ** 2)
 
 
 @torch.no_grad()
-def collect_tau_on_prompts(model_th, tokenizer, prompts, device, top_p=0.95, temperature=1.0):
+def collect_sigma2_on_prompts(
+    model_th,
+    tokenizer,
+    prompts: List[str],
+    device: torch.device,
+    top_p: float = 0.95,
+    temperature: float = 1.0,
+) -> np.ndarray:
     vals = []
     for p in prompts:
-        vals.append(tau_for_first_generated_token(model_th, tokenizer, p, device, top_p, temperature))
+        vals.append(sigma2_for_first_generated_token(model_th, tokenizer, p, device, top_p, temperature))
     return np.array(vals, dtype=np.float32)
 
 
-def plot_synth_ambiguity_multi(synth_by_ds: Dict[str, Dict[str, np.ndarray]], out_dir: str):
-    out_dir = Path(out_dir)
-    datasets = list(synth_by_ds.keys())
-    n = len(datasets)
-
-    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 3.6), sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, datasets):
-        tau_det = synth_by_ds[ds]["tau_det"]
-        tau_open = synth_by_ds[ds]["tau_open"]
-        data = [tau_det, tau_open]
-        ax.boxplot(data, labels=["Deterministic", "Open-class"], showfliers=False)
-        ax.set_title(ds)
-        if ax is axes[0]:
-            ax.set_ylabel("τ at slot")
-
-    fig.suptitle("Synthetic ambiguity probe (τ higher on open-class?)")
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
-    fig.savefig(out_dir / "fig_synth_ambiguity.png", dpi=250)
-    plt.close(fig)
-
-
 # ----------------------------
-# Risk–coverage (τ vs confidence)
+# Risk–coverage curves (σ² vs confidence)
 # ----------------------------
-@torch.no_grad()
-def risk_coverage_curves(model_b, model_th, loader, device, max_batches=None):
-    logits_b_list = []
-    logits_t_base_list = []
-    labels_list = []
-    tau_list = []
+def compute_risk_coverage(
+    conf_b: np.ndarray,
+    corr_b: np.ndarray,
+    sigma2: np.ndarray,
+    corr_th: np.ndarray,
+    cov_grid: Optional[np.ndarray] = None,
+):
+    """
+    Compute risk–coverage curves:
+      - baseline: coverage by descending confidence
+      - thermal: coverage by ascending σ² (abstain on high σ²)
+    """
+    if cov_grid is None:
+        cov_grid = np.linspace(1.0, 0.2, 9)
 
-    seen = 0
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attn = batch["attention_mask"].to(device)
-        tokens = input_ids[:, :-1]
-        labels = input_ids[:, 1:]
-        attn = attn[:, :-1]
-
-        logits_b = model_b(input_ids=tokens, attention_mask=attn).logits
-        logits_b_list.append(logits_b.detach().cpu())
-
-        out_th = model_th(input_ids=tokens, attention_mask=attn)
-        tau = out_th.aux["tau"].detach().cpu()
-        tau_list.append(tau)
-        logits_t_base = untempered_logits_gpt2(model_th, tokens, attn).detach().cpu()
-        logits_t_base_list.append(logits_t_base)
-
-        labels_list.append(labels.detach().cpu())
-
-        seen += 1
-        if max_batches and seen >= max_batches:
-            break
-
-    logits_b = torch.cat(logits_b_list, dim=0)
-    logits_t_base = torch.cat(logits_t_base_list, dim=0)
-    labels = torch.cat(labels_list, dim=0)
-    tau = torch.cat(tau_list, dim=0)
-
-    probs_b = torch.softmax(logits_b, dim=-1)
-    conf_b, pred_b = probs_b.max(dim=-1)
-    correct_b = (pred_b == labels).float()
-
-    probs_t_base = torch.softmax(logits_t_base, dim=-1)
-    pred_t = probs_t_base.argmax(dim=-1)
-    correct_t = (pred_t == labels).float()
-
-    cov_grid = np.linspace(1.0, 0.2, 9)
-    conf_vals = conf_b.flatten().numpy()
-    tau_vals = tau.flatten().numpy()
+    conf_vals = conf_b
+    sigma2_vals = sigma2
 
     res_baseline = []
     res_thermal = []
 
     for cov in cov_grid:
-        # confidence-based coverage
+        # Confidence-based coverage
         t_conf = np.quantile(conf_vals, 1.0 - cov)
-        keep_b = (conf_b >= t_conf).float()
-        acc_b = (correct_b * keep_b).sum().item() / max(1.0, keep_b.sum().item())
+        keep_b = conf_vals >= t_conf
+        if keep_b.sum() > 0:
+            acc_b = corr_b[keep_b].mean()
+        else:
+            acc_b = np.nan
         res_baseline.append((cov, acc_b))
 
-        # τ-based coverage (abstain on high τ)
-        t_tau = np.quantile(tau_vals, cov)  # keep τ < t_tau
-        keep_t = (tau < t_tau).float()
-        acc_t = (correct_t * keep_t).sum().item() / max(1.0, keep_t.sum().item())
+        # σ²-based coverage (abstain on high σ²)
+        t_sigma = np.quantile(sigma2_vals, cov)  # keep σ² < t_sigma
+        keep_t = sigma2_vals < t_sigma
+        if keep_t.sum() > 0:
+            acc_t = corr_th[keep_t].mean()
+        else:
+            acc_t = np.nan
         res_thermal.append((cov, acc_t))
 
     return res_baseline, res_thermal
 
 
+# ----------------------------
+# Plot helpers
+# ----------------------------
+def plot_ce_sigma2_multi(results_by_ds: Dict[str, Dict], out_dir: str, n_bins: int = 20):
+    """
+    For each dataset: plot binned σ² vs CE, with corr(CE,σ²) in the title.
+    """
+    out_dir = Path(out_dir)
+    datasets = list(results_by_ds.keys())
+    n = len(datasets)
+
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 3.8), sharey=False)
+    if n == 1:
+        axes = [axes]
+
+    for ax, ds in zip(axes, datasets):
+        stats = results_by_ds[ds]["stats"]
+        ce = stats["ce"]
+        sigma2 = stats["sigma2"]
+
+        # correlation
+        r = float(np.corrcoef(ce, sigma2)[0, 1])
+
+        # bin CE and compute mean σ² per bin
+        qs = np.quantile(ce, np.linspace(0, 1, n_bins + 1))
+        ce_centers = []
+        sigma_means = []
+        for i in range(n_bins):
+            lo, hi = qs[i], qs[i + 1]
+            if i < n_bins - 1:
+                mask = (ce >= lo) & (ce < hi)
+            else:
+                mask = (ce >= lo) & (ce <= hi)
+            if mask.sum() == 0:
+                continue
+            ce_centers.append(0.5 * (lo + hi))
+            sigma_means.append(sigma2[mask].mean())
+
+        ax.plot(ce_centers, sigma_means, marker="o", linewidth=1.8)
+        ax.set_title(f"{ds} (r={r:.2f})")
+        ax.set_xlabel("Token NLL (cross-entropy)")
+        if ax is axes[0]:
+            ax.set_ylabel(r"Mean $\sigma_t^2$")
+
+    fig.suptitle(r"Alignment between token NLL and microscopic temperature $\sigma_t^2$")
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+    fig.savefig(out_dir / "fig_ce_sigma2.png", dpi=250)
+    plt.close(fig)
+
+
 def plot_risk_coverage_multi(risk_by_ds: Dict[str, Dict[str, List[Tuple[float, float]]]], out_dir: str):
+    """
+    Plot risk–coverage curves for each dataset.
+    """
     out_dir = Path(out_dir)
     datasets = list(risk_by_ds.keys())
     n = len(datasets)
 
-    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 3.6), sharey=True)
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 3.8), sharey=True)
     if n == 1:
         axes = [axes]
 
@@ -730,18 +616,47 @@ def plot_risk_coverage_multi(risk_by_ds: Dict[str, Dict[str, List[Tuple[float, f
         res_t = risk_by_ds[ds]["thermal"]
         cov_b, acc_b = zip(*res_b)
         cov_t, acc_t = zip(*res_t)
-        ax.plot(cov_b, acc_b, marker="o", label="Confidence (Baseline)")
-        ax.plot(cov_t, acc_t, marker="s", label="τ (Thermal)")
+        ax.plot(cov_b, acc_b, marker="o", label="Confidence (baseline)")
+        ax.plot(cov_t, acc_t, marker="s", label=r"$\sigma^2$ (thermal)")
         ax.set_title(ds)
         ax.set_xlabel("Coverage")
         if ax is axes[0]:
-            ax.set_ylabel("Accuracy (kept tokens)")
-        ax.legend()
+            ax.set_ylabel("Accuracy on kept tokens")
+        ax.set_ylim(0.0, 1.05)
+        ax.legend(loc="lower left")
 
-    fig.suptitle("Risk–coverage (validation)")
+    fig.suptitle("Risk–coverage: confidence vs microscopic temperature gating")
     fig.tight_layout()
     fig.subplots_adjust(top=0.88)
     fig.savefig(out_dir / "fig_risk_coverage.png", dpi=250)
+    plt.close(fig)
+
+
+def plot_synth_ambiguity_multi(synth_by_ds: Dict[str, Dict[str, np.ndarray]], out_dir: str):
+    """
+    Boxplots of σ² on deterministic vs open-class prompts.
+    """
+    out_dir = Path(out_dir)
+    datasets = list(synth_by_ds.keys())
+    n = len(datasets)
+
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 3.8), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, ds in zip(axes, datasets):
+        sigma2_det = synth_by_ds[ds]["sigma2_det"]
+        sigma2_open = synth_by_ds[ds]["sigma2_open"]
+        data = [sigma2_det, sigma2_open]
+        ax.boxplot(data, labels=["Deterministic", "Open-class"], showfliers=False)
+        ax.set_title(ds)
+        if ax is axes[0]:
+            ax.set_ylabel(r"$\sigma_t^2$ at generated slot")
+
+    fig.suptitle(r"Synthetic ambiguity probe: $\sigma_t^2$ on deterministic vs open-class prompts")
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+    fig.savefig(out_dir / "fig_synth_ambiguity.png", dpi=250)
     plt.close(fig)
 
 
@@ -766,14 +681,39 @@ def main():
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Accumulate results per dataset
     results_by_ds: Dict[str, Dict] = {}
     synth_by_ds: Dict[str, Dict[str, np.ndarray]] = {}
     risk_by_ds: Dict[str, Dict[str, List[Tuple[float, float]]]] = {}
+    summary = {}
+
+    # Fixed prompts used across datasets
+    det_prompts = [
+        "2 + 2 = ",
+        "Paris is the capital of ",
+        "JPY is the national currency of ",
+        "H2O is the chemical symbol for ",
+        "Einstein's first name is ",
+        "The opposite of hot is ",
+        "A week has seven ",
+        "January is the first month of the ",
+    ] * 25
+
+    open_prompts = [
+        "He lived in France. ",
+        "To conclude, ",
+        "I must say, ",
+        "The story ended with a",
+        "She bought a ",
+        "The discovery suggests that ",
+        "The time was ripe. ",
+        "Their favorite movie is Jurassic Park, however, the ",
+    ] * 25
 
     for ds_tag in args.datasets:
         print(f"\n=== Dataset: {ds_tag} ===")
-        tokenizer, model_b, model_th, paths = load_models_for_dataset(args.ckpt_dir, ds_tag, device)
+        tokenizer, model_b, model_th, paths, base_args, th_args = load_models_for_dataset(
+            args.ckpt_dir, ds_tag, device
+        )
         print(f"[Loaded] baseline: {paths['baseline']}")
         print(f"[Loaded] thermal : {paths['thermal']}")
 
@@ -781,105 +721,74 @@ def main():
             ds_tag, tokenizer, block_size=args.block_size, batch_size=args.batch_size
         )
 
-        # Eval (PPL/ECE, τ–entropy)
-        base_eval = eval_epoch(
+        # Core token-level stats
+        stats = collect_stats(
             model_b,
-            val_loader,
-            device,
-            variant="baseline",
-            max_batches=args.max_batches,
-            for_tau_entropy=False,
-        )
-        therm_eval = eval_epoch(
             model_th,
             val_loader,
             device,
-            variant="thermal",
             max_batches=args.max_batches,
-            for_tau_entropy=True,
         )
-        print(f"[PPL-{ds_tag}] baseline={base_eval['ppl']:.2f} | thermal={therm_eval['ppl']:.2f}")
 
-        # Copy tau eval separately for clarity
-        therm_eval_tau = {
-            "tau_vec": therm_eval["tau_vec"],
-            "ent_vec": therm_eval["ent_vec"],
-            "acc_vec": therm_eval["acc_vec"],
-        }
+        print(
+            f"[PPL-{ds_tag}] baseline={stats['baseline_ppl']:.2f} | "
+            f"thermal={stats['thermal_ppl']:.2f}"
+        )
+        ce = stats["ce"]
+        sigma2 = stats["sigma2"]
+        corr_ce_sigma2 = float(np.corrcoef(ce, sigma2)[0, 1])
+        print(f"[Corr-{ds_tag}] corr(CE, σ²) = {corr_ce_sigma2:.3f}")
 
-        results_by_ds[ds_tag] = {
-            "baseline_eval": base_eval,
-            "thermal_eval": therm_eval,
-            "thermal_eval_tau": therm_eval_tau,
-            "paths": paths,
-        }
-
-        # Synthetic ambiguity probe for this dataset's thermal model
-        det_prompts = [
-            "2 + 2 = ",
-            "Paris is the capital of ",
-            "JPY is the national currency of ",
-            "H2O is the chemical symbol for ",
-            "Einstein's first name is ",
-            "The opposite of hot is ",
-            "A week has seven ",
-            "January is the first month of the ",
-        ] * 25
-
-        open_prompts = [
-            "He lived in France. ",
-            "To conclude, ",
-            "I must say, ",
-            "The story ended with a",
-            "She bought a ",
-            "The discovery suggests that ",
-            "The time was ripe. ",
-            "Their favorite movie is Jurassic Park, however, the ",
-        ] * 25
-
-        tau_det = collect_tau_on_prompts(model_th, tokenizer, det_prompts, device=device)
-        tau_open = collect_tau_on_prompts(model_th, tokenizer, open_prompts, device=device)
-
-        synth_by_ds[ds_tag] = {
-            "tau_det": tau_det,
-            "tau_open": tau_open,
-        }
-
-        # Risk–coverage curves for this dataset
-        res_b, res_t = risk_coverage_curves(
-            model_b, model_th, val_loader, device, max_batches=args.max_batches
+        # Risk–coverage curves
+        res_b, res_t = compute_risk_coverage(
+            conf_b=stats["conf_b"],
+            corr_b=stats["corr_b"],
+            sigma2=stats["sigma2"],
+            corr_th=stats["corr_th"],
         )
         risk_by_ds[ds_tag] = {
             "baseline": res_b,
             "thermal": res_t,
         }
 
-    # 1) PPL & ECE (+ reliability)
-    plot_ppl_ece_multi(results_by_ds, args.out_dir)
+        # Synthetic ambiguity probe for this dataset's thermal model
+        sigma2_det = collect_sigma2_on_prompts(model_th, tokenizer, det_prompts, device=device)
+        sigma2_open = collect_sigma2_on_prompts(model_th, tokenizer, open_prompts, device=device)
 
-    # 2) τ–entropy alignment
-    plot_tau_entropy_multi(results_by_ds, args.out_dir, n_quant=10)
+        synth_by_ds[ds_tag] = {
+            "sigma2_det": sigma2_det,
+            "sigma2_open": sigma2_open,
+        }
+
+        results_by_ds[ds_tag] = {
+            "stats": stats,
+            "paths": paths,
+            "corr_ce_sigma2": corr_ce_sigma2,
+        }
+
+        summary[ds_tag] = {
+            "baseline_ckpt": paths["baseline"],
+            "thermal_ckpt": paths["thermal"],
+            "ppl": {
+                "baseline": stats["baseline_ppl"],
+                "thermal": stats["thermal_ppl"],
+            },
+            "corr_ce_sigma2": corr_ce_sigma2,
+        }
+
+    # 1) CE–σ² alignment
+    plot_ce_sigma2_multi(results_by_ds, args.out_dir, n_bins=20)
+
+    # 2) Risk–coverage curves
+    plot_risk_coverage_multi(risk_by_ds, args.out_dir)
 
     # 3) Synthetic ambiguity probe
     plot_synth_ambiguity_multi(synth_by_ds, args.out_dir)
 
-    # 4) Risk–coverage curves
-    plot_risk_coverage_multi(risk_by_ds, args.out_dir)
-
     # Save a tiny report
-    report = {}
-    for ds in args.datasets:
-        report[ds] = {
-            "baseline_ckpt": results_by_ds[ds]["paths"]["baseline"],
-            "thermal_ckpt": results_by_ds[ds]["paths"]["thermal"],
-            "ppl": {
-                "baseline": results_by_ds[ds]["baseline_eval"]["ppl"],
-                "thermal": results_by_ds[ds]["thermal_eval"]["ppl"],
-            },
-        }
     with open(Path(args.out_dir) / "summary_multi.json", "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\n[Done] Figures saved to {args.out_dir}")
+        json.dump(summary, f, indent=2)
+    print(f"\n[Done] Figures and summary saved to {args.out_dir}")
 
 
 if __name__ == "__main__":

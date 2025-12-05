@@ -13,7 +13,7 @@ Datasets (all treated autoregressively, LM-style):
 
 This trains and evaluates models with:
   - Perplexity (LM-style next-token prediction)
-  - Entropy, τ statistics, corr(entropy, τ) (for thermal variant)
+  - Entropy, σ² statistics, corr(entropy, σ²) (for thermal/S-TLM variant)
   - Stepwise evaluation with --eval_every (more frequent than epochs)
   - Optional LoRA adapters with dropout (--use_lora)
 
@@ -21,8 +21,9 @@ Example:
 
 python train_gpt2.py \
   --datasets c4-small wikitext-103 nq_open \
-  --variants baseline \
-  --max_steps 5000
+  --variants thermal \
+  --freeze_backbone \
+  --max_steps 20000
 """
 
 import os
@@ -136,27 +137,29 @@ def collect_param_groups(
     wd: float,
     variant: str,
     lora_lr: Optional[float] = None,
-    tau_lr_mult: float = 0.5,
+    sigma_lr_mult: float = 0.5,
 ):
     """
-    Separate base / tau / LoRA params with possibly different learning rates.
+    Separate base / thermal-head / LoRA params with possibly different learning rates.
+
+    For the 'thermal' (S-TLM) variant, the thermal head is fc_logsigma.
     """
     groups = []
-    lora_params, tau_params, base_params = [], [], []
+    lora_params, thermal_head_params, base_params = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if "lora_" in n or "lora_A" in n or "lora_B" in n:
             lora_params.append(p)
-        elif variant == "thermal" and n.startswith("fc_logtau"):
-            tau_params.append(p)
+        elif variant == "thermal" and n.startswith("fc_logsigma"):
+            thermal_head_params.append(p)
         else:
             base_params.append(p)
 
     if base_params:
         groups.append({"params": base_params, "lr": base_lr, "weight_decay": wd})
-    if tau_params:
-        groups.append({"params": tau_params, "lr": base_lr * tau_lr_mult, "weight_decay": wd})
+    if thermal_head_params:
+        groups.append({"params": thermal_head_params, "lr": base_lr * sigma_lr_mult, "weight_decay": wd})
     if lora_params:
         groups.append({"params": lora_params, "lr": lora_lr or base_lr, "weight_decay": wd})
     return groups
@@ -168,20 +171,29 @@ def collect_param_groups(
 def forward_three(model, tokens, attn, variant: str):
     """
     Standardize outputs across variants.
-    Returns: (logits_for_eval, logits_for_loss, logtau_field)
-      logits_*: (B, T, V)
-      logtau_field: (B, T)
+    Returns: (logits_for_eval, logits_for_loss, logtemp_field)
+
+      logits_*:      (B, T, V)
+      logtemp_field: (B, T)   # here: log σ_t (or log τ_t for legacy)
     """
     if variant == "thermal":
         out = model(input_ids=tokens, attention_mask=attn)
         logits = out.logits
         aux = getattr(out, "aux", None)
-        if aux is not None and "logtau" in aux:
-            logtau = aux["logtau"]
+
+        if aux is not None:
+            if "logsigma" in aux:
+                logtemp = aux["logsigma"]   # S-TLM head
+            elif "logsigma" in aux:
+                logtemp = aux["logsigma"]     # legacy thermal head, if present
+            else:
+                B, T, _ = logits.size()
+                logtemp = torch.zeros(B, T, device=logits.device, dtype=logits.dtype)
         else:
             B, T, _ = logits.size()
-            logtau = torch.zeros(B, T, device=logits.device, dtype=logits.dtype)
-        return logits, logits, logtau
+            logtemp = torch.zeros(B, T, device=logits.device, dtype=logits.dtype)
+
+        return logits, logits, logtemp
     else:
         out = model(input_ids=tokens, attention_mask=attn)
         logits = out.logits
@@ -349,21 +361,33 @@ def nq_open_build_train_val(
 
 
 # ===============================
-# Evaluation (PPL, entropy, τ corr)
+# Evaluation (PPL, entropy, σ² corr)
 # ===============================
+@torch.no_grad()
 @torch.no_grad()
 def evaluate_autoregressive(model, loader, device, variant: str):
     """
     LM-style evaluation:
       - labels are next-token targets (shifted input_ids)
       - perplexity over all non-masked tokens
+
+    For the thermal variant, we also compute:
+      - mean token entropy
+      - mean σ² (treated as local temperature)
+      - corr(CE, σ²): correlation between per-token cross-entropy and σ²
     """
     model.eval()
     total_nll = 0.0
     total_tok = 0
 
-    n = 0
-    sx = sy = sx2 = sy2 = sxy = 0.0
+    # For mean entropy / mean temperature
+    ent_sum = 0.0
+    temp_sum = 0.0
+    temp_count = 0
+
+    # For correlation between CE and σ²
+    n_ce = 0
+    s_ce = s_temp = s_ce2 = s_temp2 = s_ce_temp = 0.0
 
     for batch in loader:
         ids = batch["input_ids"].to(device)
@@ -372,15 +396,16 @@ def evaluate_autoregressive(model, loader, device, variant: str):
         tokens = ids[:, :-1].contiguous()
         labels_tgt = ids[:, 1:].contiguous()
         attn_tok = attn[:, :-1].contiguous()
-        valid = attn_tok > 0
+        valid = attn_tok > 0  # (B, T)
 
-        logits_eval, logits_loss, logtau = forward_three(model, tokens, attn_tok, variant)
+        logits_eval, logits_loss, logtemp = forward_three(model, tokens, attn_tok, variant)
         B, T, V = logits_loss.size()
 
         labels_flat = labels_tgt.view(-1)
         logits_flat = logits_loss.view(-1, V)
         valid_flat = valid.view(-1)
 
+        # Per-token CE (flattened)
         ce_all = F.cross_entropy(
             logits_flat,
             labels_flat.clamp_min(0),
@@ -390,45 +415,69 @@ def evaluate_autoregressive(model, loader, device, variant: str):
         total_nll += float(ce_valid.sum().item())
         total_tok += int(valid_flat.sum().item())
 
-        # Entropy & τ stats on valid positions
+        # Entropy & temperature stats on valid positions
+        probs = torch.softmax(logits_eval, dim=-1)
+        token_ent_all = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)  # (B, T)
+
         if variant == "thermal":
-            probs = torch.softmax(logits_eval, dim=-1)  # uses τ-scaled logits
-            token_ent_all = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-            tau_field_all = logtau.exp()
+            # logtemp is log σ_t; treat σ_t² as micro-temperature
+            sigma = logtemp.exp()
+            temp_field_all = sigma ** 2  # (B, T)
         else:
-            probs = torch.softmax(logits_eval, dim=-1)
-            token_ent_all = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-            tau_field_all = torch.zeros_like(token_ent_all)
+            temp_field_all = torch.zeros_like(token_ent_all)
 
-        x = token_ent_all[valid].reshape(-1).double()
-        y = tau_field_all[valid].reshape(-1).double()
-        nb = x.numel()
-        if nb == 0:
-            continue
+        # ---- Mean entropy / mean temperature over valid tokens ----
+        ent_valid = token_ent_all[valid].double()      # (N_valid_batch,)
+        temp_valid = temp_field_all[valid].double()    # (N_valid_batch,)
 
-        n += nb
-        sx += x.sum().item()
-        sy += y.sum().item()
-        sx2 += (x * x).sum().item()
-        sy2 += (y * y).sum().item()
-        sxy += (x * y).sum().item()
+        nb = ent_valid.numel()
+        if nb > 0:
+            ent_sum += ent_valid.sum().item()
+            temp_sum += temp_valid.sum().item()
+            temp_count += nb
 
+        # ---- Correlation between CE and temperature (σ²) ----
+        # reshape CE back to (B, T) to align with temp_field_all
+        ce_all_tok = ce_all.view(B, T)                 # (B, T)
+        ce_valid_tok = ce_all_tok[valid].double()      # (N_valid_batch,)
+
+        # temp_valid already aligned (same mask)
+        ce_vec = ce_valid_tok
+        temp_vec = temp_valid
+
+        nb_ce = ce_vec.numel()
+        if nb_ce > 0:
+            n_ce += nb_ce
+            s_ce += ce_vec.sum().item()
+            s_temp += temp_vec.sum().item()
+            s_ce2 += (ce_vec * ce_vec).sum().item()
+            s_temp2 += (temp_vec * temp_vec).sum().item()
+            s_ce_temp += (ce_vec * temp_vec).sum().item()
+
+    # Perplexity
     if total_tok == 0:
         ppl = float("inf")
     else:
         mean_nll = total_nll / total_tok
         ppl = math.exp(mean_nll)
 
-    denom_x = n * sx2 - (sx ** 2)
-    denom_y = n * sy2 - (sy ** 2)
-    if n > 1 and denom_x > 0 and denom_y > 0:
-        corr = (n * sxy - sx * sy) / math.sqrt(denom_x * denom_y)
+    # Means
+    if temp_count > 0:
+        ent_mean = ent_sum / temp_count
+        temp_mean = temp_sum / temp_count
     else:
-        corr = 0.0
+        ent_mean = 0.0
+        temp_mean = 0.0
 
-    ent_mean = sx / max(1, n)
-    tau_mean = sy / max(1, n)
-    return float(ppl), float(ent_mean), float(tau_mean), float(corr)
+    # Corr(CE, σ²)
+    denom_ce = n_ce * s_ce2 - (s_ce ** 2)
+    denom_temp = n_ce * s_temp2 - (s_temp ** 2)
+    if n_ce > 1 and denom_ce > 0 and denom_temp > 0:
+        corr_ce_temp = (n_ce * s_ce_temp - s_ce * s_temp) / math.sqrt(denom_ce * denom_temp)
+    else:
+        corr_ce_temp = 0.0
+
+    return float(ppl), float(ent_mean), float(temp_mean), float(corr_ce_temp)
 
 
 # ===============================
@@ -493,12 +542,14 @@ def train_one_task(args):
 
     # Model
     if args.variant == "thermal":
+        # Map sigma_* CLI flags onto logsigma_* / sigma_smooth config for S-TLM
         model = ThermalLMForCausalLM.from_base_pretrained(
             base_model_name_or_path=args.base_model,
-            tau_clamp_min=args.tau_clamp_min,
-            tau_clamp_max=args.tau_clamp_max,
+            logsigma_clamp_min=args.sigma_clamp_min,
+            logsigma_clamp_max=args.sigma_clamp_max,
             lambda_reg=args.lambda_reg,
-            tau_smooth=args.tau_smooth,
+            sigma_smooth=args.sigma_smooth,
+            noise_at_eval=False,  # deterministic eval by default
         ).to(device)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
@@ -510,9 +561,9 @@ def train_one_task(args):
     # optionally freeze backbone
     if args.freeze_backbone:
         if args.variant == "thermal":
-            # Only train the thermal head (fc_logtau*)
+            # Only train the diffusion head (fc_logsigma*)
             for n, p in model.named_parameters():
-                if n.startswith("fc_logtau"):
+                if n.startswith("fc_logsigma"):
                     p.requires_grad = True
                 else:
                     p.requires_grad = False
@@ -535,18 +586,18 @@ def train_one_task(args):
 
     # Initial eval
     model.eval()
-    ppl_init, ent_init, tau_init, corr_init = evaluate_autoregressive(
+    ppl_init, ent_init, temp_init, corr_init = evaluate_autoregressive(
         model, val_loader, device, args.variant
     )
     tel.log(0, 0.0, "val_init", {
         "ppl": ppl_init,
         "entropy": ent_init,
-        "tau_mean": tau_init,
-        "corr_ent_tau": corr_init,
+        "sigma_mean": temp_init,          # logged as sigma_mean for backward-compat
+        "corr_ce_sigma": corr_init,
     })
     print(
         f"[Init Eval] PPL={ppl_init:.4f} | Entropy={ent_init:.4f} | "
-        f"TauMean={tau_init:.4f} | Corr(ent,τ)={corr_init:.4f}"
+        f"SigmaMean={temp_init:.4f} | Corr(CE,σ²)={corr_init:.4f}"
     )
 
     # if baseline + freeze_backbone, just checkpoint and exit
@@ -567,14 +618,14 @@ def train_one_task(args):
     bad_steps = 0
     running_loss = 0.0
 
-    # Optimizer: param groups for base / tau / LoRA (after freezing)
+    # Optimizer: param groups for base / thermal head / LoRA (after freezing)
     param_groups = collect_param_groups(
         model,
         base_lr=args.lr,
         wd=args.weight_decay,
         variant=args.variant,
         lora_lr=args.lora_lr if args.use_lora else None,
-        tau_lr_mult=args.tau_lr_mult,
+        sigma_lr_mult=args.sigma_lr_mult,
     )
     if len(param_groups) == 0:
         print("[Warning] No trainable parameters found. Exiting.")
@@ -619,19 +670,19 @@ def train_one_task(args):
                 # Eval
                 if global_step % args.eval_every == 0:
                     model.eval()
-                    ppl, ent, tau_mean, corr = evaluate_autoregressive(
+                    ppl, ent, temp_mean, corr = evaluate_autoregressive(
                         model, val_loader, device, args.variant
                     )
                     print(
                         f"[{time.strftime('%H:%M:%S')}] Eval step {global_step:05d} | "
                         f"epoch {epoch:.2f} | PPL={ppl:.4f} | "
-                        f"Entropy={ent:.4f} | TauMean={tau_mean:.4f} | Corr(ent,τ)={corr:.4f}"
+                        f"Entropy={ent:.4f} | SigmaMean={temp_mean:.4f} | Corr(CE,σ²)={corr:.4f}"
                     )
                     tel.log(global_step, epoch + i / steps_per_epoch, "val", {
                         "ppl": ppl,
                         "entropy": ent,
-                        "tau_mean": tau_mean,
-                        "corr_ent_tau": corr,
+                        "sigma_mean": temp_mean,
+                        "corr_ce_sigma": corr,
                     })
 
                     improved = (ppl < best_metric) if not higher_is_better else (ppl > best_metric)
@@ -740,7 +791,7 @@ def main():
     )
 
     # Train hparams
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
@@ -754,12 +805,17 @@ def main():
         help="If >0, stop after this many optimizer update steps (global steps).",
     )
 
-    # Thermal knobs (λ for logτ² prior)
-    p.add_argument("--lambda_reg", type=float, default=0.0, help="λ for logτ²")
-    p.add_argument("--tau_clamp_min", type=float, default=-2.0)
-    p.add_argument("--tau_clamp_max", type=float, default=1.5)
-    p.add_argument("--tau_smooth", action="store_true")
-    p.add_argument("--tau_lr_mult", type=float, default=0.5, help="LR multiplier for τ-head")
+    # Thermal knobs (λ for logσ² prior; CLI keeps sigma_* names for now)
+    p.add_argument("--lambda_reg", type=float, default=0., help="λ for (logσ)²")
+    p.add_argument("--sigma_clamp_min", type=float, default=-6.0)
+    p.add_argument("--sigma_clamp_max", type=float, default=2.0)
+    p.add_argument("--sigma_smooth", action="store_true")
+    p.add_argument(
+        "--sigma_lr_mult",
+        type=float,
+        default=0.5,
+        help="LR multiplier for thermal head (σ-head in S-TLM).",
+    )
 
     # LoRA
     p.add_argument("--use_lora", action="store_true")
@@ -772,7 +828,7 @@ def main():
     p.add_argument(
         "--freeze_backbone",
         action="store_true",
-        help="If set: baseline will only be evaluated & checkpointed; thermal will train only fc_logtau.",
+        help="If set: baseline will only be evaluated & checkpointed; thermal will train only fc_logsigma.",
     )
 
     # Saving / telemetry / eval cadence
@@ -782,7 +838,7 @@ def main():
     p.add_argument(
         "--patience_steps",
         type=int,
-        default=200,
+        default=300,
         help="early stop if no improvement for this many steps (0=off)",
     )
     p.add_argument("--wandb", action="store_true")

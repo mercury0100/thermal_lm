@@ -1,40 +1,3 @@
-"""
-Thermal Language Models (Thermal LM)
-------------------------------------
-
-A drop-in Hugging Face / PyTorch wrapper that augments any decoder-only
-Causal LM (e.g., GPT-2, OPT, etc.) with a *per-token learned temperature field*:
-
-    τ_t = exp(logτ_t) = exp(fc_logtau(h_t))
-
-The hidden temperature τ_t rescales a *normalised* token-level hidden state
-before the LM head:
-
-    ĥ_t   = h_t / ||h_t||_2
-    logits_t = lm_head(ĥ_t / τ_t)
-
-Unlike post-hoc temperature scaling, τ_t is learned end-to-end as a contextual
-control variable that modulates the energy–entropy balance of prediction.
-
-Training Objective (no thermodynamic penalty)
----------------------------------------------
-We train with standard token-level cross-entropy on τ-scaled logits:
-
-    CE_t(τ_t) = -log Softmax(logits_t)[y_t],
-    logits_t = lm_head(ĥ_t / τ_t),
-
-plus an optional quadratic regulariser on logτ_t:
-
-    𝓛_t = CE_t(τ_t) + λ · ||logτ_t||²
-
-where:
-  • τ_t is predicted from the hidden state h_t,
-  • ĥ_t is a per-token L2-normalised hidden state,
-  • λ regularizes logτ to stay near 0 (τ ≈ 1 on average).
-
-Generation uses the same τ-scaled logits: lm_head(ĥ_t / τ_t).
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Any
@@ -53,7 +16,7 @@ from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 
 # =============================
-# Config
+# Config (unchanged)
 # =============================
 
 class ThermalLMConfig(PretrainedConfig):
@@ -62,38 +25,49 @@ class ThermalLMConfig(PretrainedConfig):
     def __init__(
         self,
         base_model_name_or_path: str = "distilgpt2",
-        tau_clamp_min: float = -3.0,
-        tau_clamp_max: float = 2.0,
-        lambda_reg: float = 0.0,
-        tau_smooth: bool = False,
+        logsigma_clamp_min: float = -6.0,
+        logsigma_clamp_max: float = 2.0,
+        lambda_reg: float = 1e-5,          # kept for backwards compat; not used
+        sigma_smooth: bool = False,
+        noise_at_eval: bool = False,
+        num_mc_samples_train: int = 5,     # kept for backwards compat; not used
         **kwargs,
     ):
-        """
-        Args:
-            base_model_name_or_path: HF identifier for the base causal LM.
-            tau_clamp_min: lower bound on log τ (hard clamp or tanh range).
-            tau_clamp_max: upper bound on log τ.
-            lambda_reg: coefficient on (logτ)^2 regularisation term.
-            tau_smooth: if True, use tanh squashing into [min, max] instead
-                        of hard clamp.
-        """
         super().__init__(**kwargs)
         self.base_model_name_or_path = base_model_name_or_path
-        self.tau_clamp_min = float(tau_clamp_min)
-        self.tau_clamp_max = float(tau_clamp_max)
+        self.logsigma_clamp_min = float(logsigma_clamp_min)
+        self.logsigma_clamp_max = float(logsigma_clamp_max)
         self.lambda_reg = float(lambda_reg)
-        self.tau_smooth = bool(tau_smooth)
+        self.sigma_smooth = bool(sigma_smooth)
+        self.noise_at_eval = bool(noise_at_eval)
+        self.num_mc_samples_train = int(num_mc_samples_train)
 
-        # ensure generation-friendly config flags
         self.is_encoder_decoder = False
         self.is_decoder = True
 
 
 # =============================
-# Model
+# Calibrated heteroscedastic LM
 # =============================
 
 class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+    Variant of ThermalLM where σ behaves like calibrated aleatoric uncertainty.
+
+    Key change vs the original:
+      - Training loss (for valid next-token positions) is
+
+            s_t      = 2 * logσ_t          # = log σ_t^2
+            CE_t     = cross_entropy(z_t, y_t)
+            L_t      = exp(-s_t) * CE_t + s_t
+
+        So at optimum, exp(-s_t) * CE_t ≈ 1 => s_t ≈ log CE_t and
+        σ_t^2 = exp(s_t) ≈ CE_t. Harder tokens → larger σ_t.
+
+      - No MC over logit noise during training; noise is only used
+        at inference if `stochastic=True` or `noise_at_eval=True`.
+    """
+
     config_class = ThermalLMConfig
 
     # Convenience constructor
@@ -101,18 +75,22 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
     def from_base_pretrained(
         cls,
         base_model_name_or_path: str = "distilgpt2",
-        tau_clamp_min: float = -3.0,
-        tau_clamp_max: float = 2.0,
-        lambda_reg: float = 0.0,
-        tau_smooth: bool = False,
+        logsigma_clamp_min: float = -6.0,
+        logsigma_clamp_max: float = 2.0,
+        lambda_reg: float = 1e-5,
+        sigma_smooth: bool = False,
+        noise_at_eval: bool = False,
+        num_mc_samples_train: int = 5,
         **kwargs,
     ):
         cfg = ThermalLMConfig(
             base_model_name_or_path=base_model_name_or_path,
-            tau_clamp_min=tau_clamp_min,
-            tau_clamp_max=tau_clamp_max,
+            logsigma_clamp_min=logsigma_clamp_min,
+            logsigma_clamp_max=logsigma_clamp_max,
             lambda_reg=lambda_reg,
-            tau_smooth=tau_smooth,
+            sigma_smooth=sigma_smooth,
+            noise_at_eval=noise_at_eval,
+            num_mc_samples_train=num_mc_samples_train,
             **kwargs,
         )
         return cls(cfg)
@@ -129,7 +107,6 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
         hidden = None
         if hasattr(self.base, "transformer"):
             self.transformer = self.base.transformer
-            # many GPT-like models expose lm_head
             self.lm_head = getattr(self.base, "lm_head", self.base.get_output_embeddings())
             hidden = getattr(self.base.config, "n_embd", None)
         elif hasattr(self.base, "model"):
@@ -137,7 +114,6 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
             self.lm_head = self.base.get_output_embeddings()
             hidden = getattr(self.base.config, "hidden_size", None)
         else:
-            # very generic fallback
             self.transformer = None
             self.lm_head = self.base.get_output_embeddings()
             hidden = getattr(self.lm_head, "in_features", None)
@@ -145,39 +121,39 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
         if hidden is None:
             raise RuntimeError("Could not infer hidden size for base LM.")
 
-        # 3) Per-token log-temperature head (scalar)
-        self.fc_logtau = nn.Linear(hidden, 1)
-        nn.init.normal_(self.fc_logtau.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.fc_logtau.bias, 0.0)
+        # 3) Per-token log σ_t head (scalar diffusion / temperature scale)
+        self.fc_logsigma = nn.Linear(hidden, 1)
+        nn.init.normal_(self.fc_logsigma.weight, mean=0.0, std=1e-3)
+        nn.init.constant_(self.fc_logsigma.bias, 0.0)
 
         # 4) Hyperparameters
-        self.tau_clamp_min = config.tau_clamp_min
-        self.tau_clamp_max = config.tau_clamp_max
-        self.tau_smooth = config.tau_smooth
-        self.lambda_reg = config.lambda_reg
+        self.logsigma_clamp_min = config.logsigma_clamp_min
+        self.logsigma_clamp_max = config.logsigma_clamp_max
+        self.sigma_smooth = config.sigma_smooth
+        self.noise_at_eval = config.noise_at_eval
 
-        # training helpers
         self.ignore_index = -100  # HF default
 
     # -----------------------------
-    # τ parameterization utilities
+    # σ parameterization utilities
     # -----------------------------
-    def _tau_from_logtau(self, logtau_raw: torch.Tensor):
+    def _sigma_from_logsigma(self, logsigma_raw: torch.Tensor):
         """
-        Map raw logτ to (logτ_clamped_or_squashed, τ) with either:
-          - hard clamp to [tau_clamp_min, tau_clamp_max], or
-          - smooth tanh into that range if tau_smooth=True.
+        Map raw log σ to (logsigma_clamped_or_squashed, σ).
+
+        logsigma is log σ (not log σ^2). For the heteroscedastic loss we use
+        s = 2 * logsigma = log σ^2.
         """
-        if self.tau_smooth:
-            lo, hi = self.tau_clamp_min, self.tau_clamp_max
+        if self.sigma_smooth:
+            lo, hi = self.logsigma_clamp_min, self.logsigma_clamp_max
             mid = 0.5 * (lo + hi)
             half = 0.5 * (hi - lo)
-            logtau = mid + half * torch.tanh(logtau_raw)
+            logsigma = mid + half * torch.tanh(logsigma_raw)
         else:
-            logtau = logtau_raw.clamp(self.tau_clamp_min, self.tau_clamp_max)
+            logsigma = logsigma_raw.clamp(self.logsigma_clamp_min, self.logsigma_clamp_max)
 
-        tau = torch.exp(logtau)
-        return logtau, tau
+        sigma = torch.exp(logsigma)
+        return logsigma, sigma
 
     # -----------------------------
     # Backbone forward
@@ -190,9 +166,6 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         **kwargs: Any,
     ):
-        """
-        Run the base transformer to get hidden states (h) and the original model output.
-        """
         if hasattr(self.base, "transformer"):
             out = self.transformer(
                 input_ids=input_ids,
@@ -223,8 +196,15 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Any] = None,
         use_cache: Optional[bool] = None,
+        stochastic: Optional[bool] = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithCrossAttentions:
+
+        # Decide whether to inject noise into logits for this call
+        if stochastic is None:
+            inject_noise_for_logits = self.training or self.noise_at_eval
+        else:
+            inject_noise_for_logits = bool(stochastic)
 
         # Base hidden states
         h, base_out = self._forward_hidden(
@@ -235,77 +215,101 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        # temperatures
-        logtau_raw = self.fc_logtau(h).squeeze(-1)           # (B, T)
-        logtau_full, tau_full = self._tau_from_logtau(logtau_raw)  # both (B, T)
+        # Per-token σ_t
+        logsigma_raw = self.fc_logsigma(h).squeeze(-1)                        # (B, T)
+        logsigma_full, sigma_full = self._sigma_from_logsigma(logsigma_raw)   # both (B, T)
 
-        # -------------------------------------------
-        # 1) Per-token L2 normalisation of hidden state
-        # -------------------------------------------
-        h_norm = h / (h.norm(dim=-1, keepdim=True) + 1e-8)   # (B, T, D)
-
-        # -------------------------------------------
-        # 2) Scale by τ: h_scaled = h_norm / τ
-        # -------------------------------------------
-        h_scaled = h_norm / tau_full.unsqueeze(-1)           # (B, T, D)
-
-        # -------------------------------------------
-        # 3) Project to logits
-        # -------------------------------------------
-        logits_tau = self.lm_head(h_scaled)                  # (B, T, V)
+        # Base logits z_t
+        logits_base = self.lm_head(h)                                         # (B, T, V)
 
         loss: Optional[torch.Tensor] = None
+
+        # ==========================================
+        # Case 1: training / teacher forcing
+        # ==========================================
         if labels is not None:
-            # shift for causal LM
-            logits_data = logits_tau[:, :-1, :]              # (B, T-1, V)
-            targets = labels[:, 1:]                          # (B, T-1)
+            # For outputs, expose deterministic logits (base LM)
+            logits = logits_base
+
+            # Standard causal shift
+            logits_shift = logits_base[:, :-1, :]                             # (B, T-1, V)
+            targets = labels[:, 1:]                                           # (B, T-1)
 
             if attention_mask is not None:
                 attn = attention_mask[:, 1:]
             else:
                 attn = torch.ones_like(targets, dtype=torch.long)
 
-            valid = (targets != self.ignore_index) & (attn > 0)
+            valid = (targets != self.ignore_index) & (attn > 0)               # (B, T-1)
 
-            # STANDARD CE ON τ-SCALED LOGITS
-            logp = F.log_softmax(logits_data, dim=-1)        # (B, T-1, V)
-            gathered = logp.gather(
-                -1, targets.clamp_min(0).unsqueeze(-1)
-            ).squeeze(-1)                                    # (B, T-1)
-            ce_loss = -gathered[valid]                       # (N_valid,)
+            B, Tm1, V = logits_shift.size()
 
-            loss = ce_loss.mean()
+            if valid.any():
+                # Flatten
+                logits_flat = logits_shift.reshape(-1, V)                     # (B*(T-1), V)
+                targets_flat = targets.reshape(-1)                            # (B*(T-1),)
+                valid_flat = valid.reshape(-1)                                # (B*(T-1),)
 
-            # regularise logτ toward 0 (τ ≈ 1)
-            logtau_valid = logtau_full[:, :-1][valid]
-            if self.lambda_reg > 0.0 and logtau_valid.numel() > 0:
-                loss = loss + self.lambda_reg * (logtau_valid ** 2).mean()
+                # CE on deterministic base logits
+                # (ignore_index handled via masking)
+                ce_all = F.cross_entropy(
+                    logits_flat,
+                    targets_flat.clamp_min(0),
+                    reduction="none",
+                )                                                             # (B*(T-1),)
+                ce_valid = ce_all[valid_flat]                                 # (N_valid,)
+
+                # s_t = log σ_t^2 = 2 * logsigma
+                logsigma_shift = logsigma_full[:, :-1]                        # (B, T-1)
+                s_all = (2.0 * logsigma_shift).reshape(-1)                    # (B*(T-1),)
+                s_valid = s_all[valid_flat]                                   # (N_valid,)
+
+                # Kendall-style heteroscedastic CE:
+                # L_t = exp(-s_t) * CE_t + s_t
+                loss_tokens = torch.exp(-s_valid) * ce_valid + s_valid
+                loss = loss_tokens.mean()
+            else:
+                loss = logits_base.new_tensor(0.0)
+
+        # ==========================================
+        # Case 2: pure forward / generation
+        # ==========================================
+        else:
+            if inject_noise_for_logits:
+                eps = torch.randn_like(logits_base)
+                logits = logits_base + sigma_full.unsqueeze(-1) * eps
+            else:
+                logits = logits_base
 
         out = CausalLMOutputWithCrossAttentions(
             loss=loss,
-            logits=logits_tau,  # generation uses τ-scaled logits
+            logits=logits,
             past_key_values=getattr(base_out, "past_key_values", None),
             hidden_states=getattr(base_out, "hidden_states", None),
             attentions=getattr(base_out, "attentions", None),
             cross_attentions=getattr(base_out, "cross_attentions", None),
         )
 
-        # Attach aux fields for analysis/visualization (unshifted length)
-        out.aux = {"logtau": logtau_full, "tau": tau_full}
+        # Aux fields for analysis/visualisation
+        out.aux = {
+            "logsigma": logsigma_full,     # log σ_t
+            "sigma": sigma_full,           # σ_t
+            "logits_base": logits_base,    # deterministic logits
+        }
         return out
 
     # -----------------------------
     # Convenience utils
     # -----------------------------
     @torch.no_grad()
-    def get_tau_map(
+    def get_sigma_map(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """
-        Return per-token τ for a batch without computing loss.
+        Return per-token σ_t for a batch without computing loss.
         Shape: (B, T).
         """
         h, _ = self._forward_hidden(
@@ -313,6 +317,6 @@ class ThermalLMForCausalLM(PreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             **kwargs,
         )
-        logtau_raw = self.fc_logtau(h).squeeze(-1)
-        _, tau = self._tau_from_logtau(logtau_raw)
-        return tau
+        logsigma_raw = self.fc_logsigma(h).squeeze(-1)
+        _, sigma = self._sigma_from_logsigma(logsigma_raw)
+        return sigma
